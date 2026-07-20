@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement or a new capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem or use case?
+      description: What are you trying to do that WinPlay doesn't (yet) support?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution
+      description: How might it work? Link any relevant protocol notes or reference implementations.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Devices involved, alternatives you've considered, etc.

@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build installer & portable (${{ matrix.rid }})
+    runs-on: windows-latest
+    # Job-level env so the signing steps' `if:` can see whether a cert secret is set.
+    env:
+      SIGNING_PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
+      SIGNING_PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            platform: x64
+          - rid: win-arm64
+            platform: ARM64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Version from tag
+        id: ver
+        shell: pwsh
+        run: '"version=$(''${{ github.ref_name }}''.TrimStart(''v''))" >> $env:GITHUB_OUTPUT'
+
+      - name: Publish self-contained app
+        run: >
+          dotnet publish src/WinPlay.App/WinPlay.App.csproj
+          -c Release -r ${{ matrix.rid }} --self-contained true
+          -p:Platform=${{ matrix.platform }}
+          -o publish/${{ matrix.rid }}
+
+      # Optional code signing — set the SIGNING_PFX_BASE64 and SIGNING_PFX_PASSWORD repo
+      # secrets to a real Authenticode cert and the exe + installer are signed. Without
+      # them the build is unsigned (works, but Windows SmartScreen warns on first run).
+      - name: Sign application
+        if: env.SIGNING_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                Where-Object FullName -match 'x64' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:SIGNING_PFX_PASSWORD `
+            /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+            "publish/${{ matrix.rid }}/WinPlay.App.exe"
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DSourceDir=$(Resolve-Path publish/${{ matrix.rid }})" "/DAppVersion=${{ steps.ver.outputs.version }}" installer/winplay.iss
+          Move-Item installer/dist/WinPlay-*-Setup.exe "WinPlay-${{ steps.ver.outputs.version }}-${{ matrix.rid }}-Setup.exe"
+
+      - name: Sign installer
+        if: env.SIGNING_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                Where-Object FullName -match 'x64' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:SIGNING_PFX_PASSWORD `
+            /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+            "WinPlay-${{ steps.ver.outputs.version }}-${{ matrix.rid }}-Setup.exe"
+
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/${{ matrix.rid }}/* -DestinationPath "WinPlay-${{ steps.ver.outputs.version }}-${{ matrix.rid }}-portable.zip"
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            WinPlay-*-${{ matrix.rid }}-Setup.exe
+            WinPlay-*-${{ matrix.rid }}-portable.zip
+          # Fixed body (not generate_release_notes) so parallel matrix jobs / re-runs don't
+          # append the changelog multiple times.
+          body_path: installer/release-notes.md
+          append_body: false
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

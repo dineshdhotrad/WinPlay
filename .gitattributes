@@ -1,0 +1,30 @@
+# Normalize line endings: text files stored as LF in the repo, checked out native.
+* text=auto
+
+# Source is LF everywhere for deterministic diffs.
+*.cs        text eol=lf
+*.csproj    text eol=lf
+*.slnx      text eol=lf
+*.props     text eol=lf
+*.targets   text eol=lf
+*.xaml      text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.svg       text eol=lf
+*.manifest  text eol=lf
+*.appxmanifest text eol=lf
+*.editorconfig text eol=lf
+*.sh        text eol=lf
+*.ps1       text eol=crlf
+
+# Binary assets — never touch.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.icns binary
+*.dll  binary
+*.exe  binary
+*.pfx  binary

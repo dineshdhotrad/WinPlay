@@ -1,0 +1,41 @@
+name: Bug report
+description: Something isn't working (discovery, audio, pairing, mirroring…)
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact CLI command if you used it (e.g. `winplay mirror --to "Living Room TV"`).
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+  - type: input
+    id: receiver
+    attributes:
+      label: Receiver model
+      description: e.g. HomePod mini, Apple TV 4K (AppleTV11,1), Sonos One
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version & GPU
+      description: e.g. Windows 11 23H2, Intel Iris Xe
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: For streaming/mirroring issues, paste the CLI stage log (it prints each protocol step). No secrets are logged.
+      render: text

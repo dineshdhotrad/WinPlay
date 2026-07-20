@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: |
+          dotnet restore src/WinPlay.Core/WinPlay.Core.csproj
+          dotnet restore src/WinPlay.Capture/WinPlay.Capture.csproj
+          dotnet restore tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj
+          dotnet restore tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj
+          dotnet restore src/WinPlay.App/WinPlay.App.csproj
+
+      - name: Build core, capture, CLI
+        run: |
+          dotnet build tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj -c Release --no-restore
+
+      - name: Build app (WinUI)
+        run: dotnet build src/WinPlay.App/WinPlay.App.csproj -c Release -p:Platform=x64 --no-restore
+
+      - name: Test
+        run: dotnet test tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj -c Release --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/test-results.trx'
+          if-no-files-found: ignore

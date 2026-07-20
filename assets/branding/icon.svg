@@ -1,0 +1,68 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- WinPlay "Signal Tile" — iOS 26 liquid-glass app icon.
+       A glowing audio waveform framed by a display: audio + screen mirroring in one mark. -->
+  <defs>
+    <!-- Deep navy → violet field -->
+    <linearGradient id="field" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#182349"/>
+      <stop offset="0.55" stop-color="#2A1E5C"/>
+      <stop offset="1" stop-color="#3C1E70"/>
+    </linearGradient>
+    <!-- Top-left specular sheen -->
+    <radialGradient id="sheen" cx="0.28" cy="0.20" r="0.9">
+      <stop offset="0" stop-color="#8EA2FF" stop-opacity="0.45"/>
+      <stop offset="0.45" stop-color="#8EA2FF" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#8EA2FF" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Bottom vignette for depth -->
+    <radialGradient id="vignette" cx="0.5" cy="0.72" r="0.75">
+      <stop offset="0.6" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0A0A1F" stop-opacity="0.35"/>
+    </radialGradient>
+    <!-- Accent for the waveform + frame -->
+    <linearGradient id="accent" x1="300" y1="360" x2="724" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5EEAD4"/>
+      <stop offset="0.5" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#818CF8"/>
+    </linearGradient>
+    <linearGradient id="glassPanel" x1="0" y1="300" x2="0" y2="724" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.03"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="14" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="tile"><rect x="0" y="0" width="1024" height="1024" rx="228" ry="228"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#field)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"/>
+
+    <!-- Glass display panel (the "screen") -->
+    <rect x="276" y="316" width="472" height="392" rx="64" ry="64"
+          fill="url(#glassPanel)" stroke="#BFD0FF" stroke-opacity="0.35" stroke-width="3"/>
+    <!-- Top rim light on the panel -->
+    <rect x="276" y="316" width="472" height="392" rx="64" ry="64" fill="none"
+          stroke="#FFFFFF" stroke-opacity="0.30" stroke-width="2"
+          stroke-dasharray="360 900" stroke-dashoffset="-90"/>
+
+    <!-- Audio waveform: symmetric rounded bars (peak centered), glowing accent -->
+    <g fill="url(#accent)" filter="url(#glow)">
+      <rect x="345" y="437" width="46" height="150" rx="23"/>
+      <rect x="417" y="382" width="46" height="260" rx="23"/>
+      <rect x="489" y="332" width="46" height="360" rx="23"/>
+      <rect x="561" y="382" width="46" height="260" rx="23"/>
+      <rect x="633" y="437" width="46" height="150" rx="23"/>
+    </g>
+
+    <!-- Broadcast tick under the mark -->
+    <circle cx="512" cy="760" r="12" fill="#BFD0FF" fill-opacity="0.55"/>
+
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#vignette)"/>
+    <!-- Outer rim highlight (liquid-glass edge) -->
+    <rect x="6" y="6" width="1012" height="1012" rx="224" ry="224" fill="none"
+          stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="4"/>
+  </g>
+</svg>

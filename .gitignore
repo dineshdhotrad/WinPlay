@@ -1,0 +1,52 @@
+# ---- Build output ----
+[Bb]in/
+[Oo]bj/
+artifacts/
+publish/
+*.binlog
+*.log
+
+# ---- Test output ----
+[Tt]est[Rr]esults/
+*.trx
+
+*.coverage
+*.coveragexml
+
+# ---- Visual Studio / Rider / VS Code ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ---- NuGet ----
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+
+# ---- MSIX / packaging / installer ----
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.msix
+*.msixbundle
+*.pfx
+*.cer
+installer/dist/
+installer/Output/
+
+# ---- Reference cache (cloned upstream repos, RFCs) — never committed ----
+resources/
+
+# ---- Internal planning docs (kept locally, not published) ----
+docs/plan.md
+
+# ---- OS cruft ----
+Thumbs.db
+Desktop.ini
+.DS_Store
