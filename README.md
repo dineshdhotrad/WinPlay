@@ -29,10 +29,11 @@ managed .NET with a thin GPU/Media‑Foundation layer for the video hot path.
 |---|---|
 | 🔊 **System audio → any AirPlay 2 receiver** | HomePod, HomePod mini, **stereo pairs**, **multi‑room groups**, Apple TV, AirPort Express, third‑party AirPlay 2 speakers. Lossless ALAC, sample‑accurate multi‑room sync via a built‑in **PTP grandmaster clock**. |
 | 🖥️ **Screen mirroring → Apple TV** | Desktop mirrored over the AirPlay 2 mirroring protocol with **FairPlay SAP** authentication, GPU capture + encode, and **resolution negotiated from the TV** (no hardcoded caps). |
-| 🎛️ **iOS‑style picker** | A tray flyout that collapses stereo pairs and groups into single entries — just like Control Center — with per‑destination volume. |
-| 🔑 **Pairing that just works** | Transient pairing for HomePods, on‑screen **PIN pairing** for Apple TV, and fast **pair‑verify** reconnects. Credentials are stored **DPAPI‑encrypted**. |
-| 🎵 **Now Playing** | Whatever your PC is playing (Spotify, a browser, a music app) shows up on the receiver's Now Playing screen — title, artist, album, cover art. |
-| ♻️ **Resilient** | Automatic reconnect with exponential backoff when a receiver briefly drops off the network. |
+| 🎛️ **iOS‑style picker** | A tray flyout that collapses stereo pairs and groups into single entries — just like Control Center — with per‑destination volume, a Now Playing surface, and a **`Win`+`Shift`+`A`** hotkey. |
+| 🔑 **Pairing that just works** | Transient pairing for HomePods, on‑screen **PIN pairing** for Apple TV, and fast **pair‑verify** reconnects. Credentials are stored **DPAPI‑encrypted**, and each receiver's identity is **pinned across sessions**. |
+| 🎵 **Now Playing & remote control** | Your current track (title, artist, album, art) appears on the receiver — and pause/next/volume **from** the HomePod or Apple TV control the app playing on your PC. |
+| ⏱️ **Constant low latency** | Buffered AirPlay 2 audio at **~0.5 s**, held constant for the whole session — capture is locked to an absolute timeline, so jitter can never make the delay creep up. |
+| ♻️ **Resilient** | Automatic reconnect with backoff; screen capture runs **crash‑isolated** in a supervised child process; your PC's audio is never left muted, even after a crash. |
 
 ## Screenshots
 
@@ -155,15 +156,23 @@ See the [changelog](CHANGELOG.md) for release history.
 
 ## Security & privacy
 
-WinPlay talks only to receivers on your local network. Pairing credentials are stored
-DPAPI‑encrypted under your Windows user account. Like other open‑source AirPlay senders it
-does not yet cryptographically pin the receiver's identity across sessions — see
-[SECURITY.md](SECURITY.md).
+WinPlay talks only to receivers on your local network, and makes **no** outbound connections
+otherwise — there is no telemetry, and the logging stack has no network sink compiled in.
+Pairing credentials are stored DPAPI‑encrypted under your Windows user account, and each
+receiver's identity is **pinned across sessions**: Apple TVs are verified cryptographically
+on every reconnect, and a HomePod whose advertised identity changes is refused rather than
+streamed to. See [SECURITY.md](SECURITY.md) for the threat model and the exact guarantees.
 
 ## Contributing
 
 Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [code of conduct](CODE_OF_CONDUCT.md).
+
+## Support WinPlay
+
+WinPlay is free and open source, built in the open. If it earned a place in your setup,
+you can support continued development over on **[Ko-fi ☕](https://ko-fi.com/thedinesh)** —
+every bit is appreciated and keeps the project moving.
 
 ## Acknowledgements
 

@@ -55,9 +55,11 @@ public sealed class RtspConnection : IDisposable
     private int _cseq;
     private int _plainReadPos;
 
-    // Stable per-connection sender identity headers.
-    private readonly string _dacpId = Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
-    private readonly string _activeRemote = RandomNumberGenerator.GetInt32(1, int.MaxValue).ToString();
+    // Sender identity headers. DACP-ID and Active-Remote are process-wide (see DacpIdentity) so
+    // they match the iTunes_Ctrl_<id> control endpoint WinPlay advertises — a receiver resolves
+    // these headers to find where to send play/pause back. Client-Instance stays per-connection.
+    private readonly string _dacpId = Raop.DacpIdentity.DacpId;
+    private readonly string _activeRemote = Raop.DacpIdentity.ActiveRemote;
     private readonly string _clientInstance = Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
 
     public string ClientName { get; init; } = "WinPlay";
@@ -82,15 +84,36 @@ public sealed class RtspConnection : IDisposable
     /// <summary>Switches the connection to encrypted framing (call right after pair-setup).</summary>
     public void EnableEncryption(ChannelCrypto crypto) => _crypto = crypto;
 
+    /// <summary>
+    /// How long a single request may wait for its response. Every request is serialised behind
+    /// one lock, so an unbounded wait does not just hang its own caller — it also blocks the 2 s
+    /// /feedback keep-alive on the same connection. The receiver then drops the session on its
+    /// own ~30 s timer while the sender never notices, so playback ends with no error and no
+    /// Faulted event. A receiver that is alive answers in well under this.
+    /// </summary>
+    public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
+
     public async Task<RtspResponse> RequestAsync(RtspRequest request, CancellationToken ct)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            byte[] wire = BuildWire(request);
-            byte[] payload = _crypto is null ? wire : _crypto.Encrypt(wire);
-            await _stream!.WriteAsync(payload, ct).ConfigureAwait(false);
-            return await ReadResponseAsync(ct).ConfigureAwait(false);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(RequestTimeout);
+            try
+            {
+                byte[] wire = BuildWire(request);
+                byte[] payload = _crypto is null ? wire : _crypto.Encrypt(wire);
+                await _stream!.WriteAsync(payload, deadline.Token).ConfigureAwait(false);
+                return await ReadResponseAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // Distinguish "the receiver stopped answering" from "the caller cancelled":
+                // only the former should fault the session and trigger a reconnect.
+                throw new RtspException(
+                    $"{request.Method} timed out after {RequestTimeout.TotalSeconds:F0}s — receiver stopped responding");
+            }
         }
         finally
         {

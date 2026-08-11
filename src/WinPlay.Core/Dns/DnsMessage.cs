@@ -170,12 +170,19 @@ public sealed class DnsMessage
         return new TxtData(pairs);
     }
 
+    /// <summary>
+    /// Reads a wire name into RFC 1035 §5.1 presentation form. Labels are escaped as they are
+    /// appended (see <see cref="DnsName"/>): a DNS label may legally contain <c>.</c>, and a
+    /// DNS-SD instance name routinely does, so joining raw labels with dots would produce a string
+    /// nothing can split back into the labels it came from.
+    /// </summary>
     internal static string ReadName(ReadOnlySpan<byte> buf, ref int offset)
     {
         var sb = new StringBuilder();
         int pos = offset;
         int afterFirstPointer = -1;
         int jumps = 0;
+        int wireBytes = 1;   // root terminator
 
         while (true)
         {
@@ -199,8 +206,12 @@ public sealed class DnsMessage
             if ((len & 0xC0) != 0) throw new FormatException("unsupported label type");
             if (pos + 1 + len > buf.Length) throw new FormatException("label overruns buffer");
             if (sb.Length > 0) sb.Append('.');
-            sb.Append(Encoding.UTF8.GetString(buf.Slice(pos + 1, len)));
-            if (sb.Length > 1024) throw new FormatException("name too long");
+            sb.Append(DnsName.Escape(Encoding.UTF8.GetString(buf.Slice(pos + 1, len))));
+            // Bound the WIRE length, not the escaped length: compression pointers let a small
+            // packet expand a name indefinitely, and the limit that matters is the one the
+            // protocol sets (RFC 1035 §2.3.4), not how long its printable form happens to be.
+            wireBytes += len + 1;
+            if (wireBytes > DnsName.MaxNameBytes) throw new FormatException("name too long");
             pos += 1 + len;
         }
 

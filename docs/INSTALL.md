@@ -9,6 +9,14 @@
    Start Menu entry, and launches. Nothing else to preinstall (the .NET runtime and
    Windows App SDK are bundled). Uninstall any time from *Settings → Apps*.
 
+Installing a newer version **over** an existing one upgrades in place: Setup closes a running
+WinPlay, replaces it, and restarts it — you never end up with two entries in *Apps*, and your
+pairings are kept.
+
+> **ARM64:** the `win-arm64` installer refuses to install on an x64 PC (and vice-versa),
+> because the bundled runtime is architecture-specific. Pick the build that matches your PC —
+> *Settings → System → About → System type*.
+
 ## Option B — portable
 
 Prefer no install? Download `WinPlay-<version>-win-x64-portable.zip`, unzip anywhere, and
@@ -33,8 +41,19 @@ AirPlay receivers you pick on your LAN — see [SECURITY.md](../SECURITY.md).
 ### Using the tray menu
 
 - **Left-click** the tray icon to open the device picker.
+- **Press `Win`+`Shift`+`A`** to open the picker from anywhere. To change it, set a string
+  value named `Hotkey` under `HKCU\Software\WinPlay` (e.g. `Ctrl+Alt+P`). If another app
+  already owns the combination, WinPlay logs it and the tray icon keeps working.
 - **Right-click** for the menu: **Open WinPlay**, **Start with Windows** (launch at login),
-  **Support on GitHub**, **Report an issue**, and **Quit**.
+  **Support on GitHub**, **Report an issue**, **Export diagnostics…**, and **Quit**.
+
+### Reporting a problem
+
+**Right-click → Export diagnostics…** writes a `winplay-diagnostics-*.zip` to your desktop
+and opens Explorer with it selected — attach it to a GitHub issue. It contains your recent
+logs plus version/OS details. Pairing credentials are **never** included, and every file is
+scrubbed of key material first. For a deeper capture, start WinPlay with `--verbose` (or
+`--trace` for per-packet detail) and reproduce the problem before exporting.
 
 ## Option B — build from source
 
@@ -87,5 +106,11 @@ elevation is required.
 
 ## Uninstall
 
-WinPlay is portable — just delete the folder. Stored pairing credentials live in
-`%APPDATA%\WinPlay\credentials.dat`; delete it to forget all paired Apple TVs.
+**Installer builds:** *Settings → Apps → WinPlay → Uninstall*. Logs and recovery state
+(`%LOCALAPPDATA%\WinPlay`) are removed automatically, and Setup **asks** whether to delete
+your saved pairings (`%APPDATA%\WinPlay`) — answer *No* if you plan to reinstall and want to
+skip re-pairing.
+
+**Portable builds:** delete the folder. To forget paired devices, also delete
+`%APPDATA%\WinPlay` (`credentials.dat` holds Apple TV pairings; `receivers.dat` holds the
+pinned receiver identities).

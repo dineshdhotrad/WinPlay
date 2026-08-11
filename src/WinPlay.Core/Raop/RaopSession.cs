@@ -39,6 +39,25 @@ public sealed class RaopSession : IAsyncDisposable
     private readonly ulong _streamConnectionId;
     private readonly uint _ssrc;
     private readonly bool _usePtp;
+    private readonly bool _buffered;
+    private TcpClient? _audioTcp;
+    private NetworkStream? _audioTcpStream;
+    private BufferedAudioPacket? _bufferedCrypto;
+    // Buffered send-ahead lead: 0.35 s. The full latency budget, end to end:
+    //   perceived delay = lead (350 ms) + capture margin (60 ms) + capture chain (~30 ms)
+    //                   ≈ 0.44 s — at parity with Apple's own ~0.5 s buffered figure
+    //   receiver jitter headroom = lead − anchor RTT (~50 ms) ≈ 0.3 s
+    // Both are DETERMINISTIC because the start sequence performs all other RTSP round-trips
+    // before the anchor is computed and starts the pump with zero awaits after it — and the
+    // positioned capture ring holds the delay constant instead of letting it creep. Headroom
+    // below ~0.2 s risks audible dropouts on Wi-Fi bursts; realtime mode remains ~2 s.
+    private const int BufferedLeadFrames = 15435;
+
+    /// <summary>The buffered send-ahead lead in nanoseconds (~0.5 s at 44.1 kHz).</summary>
+    public static ulong BufferedLeadNanos => (ulong)((double)BufferedLeadFrames / SampleRate * 1_000_000_000);
+
+    /// <summary>True if this session negotiated a buffered (type 103) audio stream.</summary>
+    public bool IsBuffered => _buffered;
     private readonly List<IPAddress> _groupPeers = [];
     private HapPairingCredentials? _credentials;
     private PtpMaster? _ptp;
@@ -70,7 +89,7 @@ public sealed class RaopSession : IAsyncDisposable
     public long FramesSent => Interlocked.Read(ref _framesSent);
     public TimeSpan Elapsed => TimeSpan.FromSeconds(FramesSent * 352.0 / SampleRate);
 
-    private RaopSession(bool usePtp)
+    private RaopSession(bool usePtp, bool buffered)
     {
         // One session id serves as RTSP URI number and streamConnectionID — receivers
         // correlate the RTP flow with the announced stream through it. The RTP SSRC is
@@ -78,6 +97,7 @@ public sealed class RaopSession : IAsyncDisposable
         // leave it zero for PTP-timed realtime streams).
         uint sessionId = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
         _usePtp = usePtp;
+        _buffered = buffered && usePtp; // buffered audio requires the PTP timeline
         _streamConnectionId = sessionId;
         _ssrc = usePtp ? 0 : sessionId;
         _sequence = (ushort)RandomNumberGenerator.GetInt32(0, ushort.MaxValue);
@@ -97,9 +117,13 @@ public sealed class RaopSession : IAsyncDisposable
     /// </param>
     public static async Task<RaopSession> ConnectAsync(IPAddress address, int port, bool usePtp,
         IReadOnlyList<IPAddress>? groupPeers = null, Action<string>? stageChanged = null,
-        CancellationToken ct = default, HapPairingCredentials? credentials = null)
+        CancellationToken ct = default, HapPairingCredentials? credentials = null, bool buffered = false,
+        uint? sharedStartTimestamp = null)
     {
-        var s = new RaopSession(usePtp) { _credentials = credentials };
+        var s = new RaopSession(usePtp, buffered) { _credentials = credentials };
+        // A buffered group shares ONE start timestamp across all members so the same audio
+        // sample carries the same RTP time everywhere and (with the shared anchor) plays in sync.
+        if (sharedStartTimestamp is { } sts) s._startTimestamp = sts;
         if (groupPeers is not null)
             s._groupPeers.AddRange(groupPeers.Where(p => !p.Equals(address)));
         if (stageChanged is not null) s.StageChanged += stageChanged;
@@ -114,6 +138,15 @@ public sealed class RaopSession : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Whether an RTSP failure during pair-verify means "I do not know you" rather than a
+    /// transport problem. 401 and 403 are the receiver refusing this controller's identity; 470
+    /// is its request to pair afresh. Anything else — a timeout, a 5xx, a dropped connection — is
+    /// not evidence the stored credentials are dead, and must not cause them to be discarded.
+    /// </summary>
+    private static bool IsPairingRejection(RtspException ex) =>
+        ex.StatusCode is 401 or 403 or 470;
 
     private void Stage(string message) => StageChanged?.Invoke(message);
 
@@ -132,8 +165,29 @@ public sealed class RaopSession : IAsyncDisposable
         if (_credentials is not null)
         {
             Stage("pair-verify (stored credentials, X25519 + Ed25519)");
-            _hap = await HapVerifiedPairing.PairVerifyAsync(
-                ReceiverPairing.MakePost(_rtsp), _credentials, ct).ConfigureAwait(false);
+            try
+            {
+                _hap = await HapVerifiedPairing.PairVerifyAsync(
+                    ReceiverPairing.MakePost(_rtsp), _credentials, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is HapPairingException
+                                       || (ex is RtspException rtsp && IsPairingRejection(rtsp)))
+            {
+                // Stored credentials no longer work — the receiver was reset, restored, or
+                // re-paired elsewhere, so it has forgotten this controller. Previously this
+                // threw straight out with a technical message and NOTHING cleared the stale
+                // credentials, so the device failed every future attempt forever and the only
+                // fix was deleting credentials.dat by hand. Report it as re-pairing required so
+                // the caller can discard them and pair again.
+                //
+                // Both shapes count. A receiver can reject a forgotten pairing with a TLV error
+                // inside a 200 (HapPairingException) OR by refusing the request outright at the
+                // RTSP status line (RtspException). Catching only the first left the second on
+                // exactly the dead-end path this was written to remove — the user saw a raw
+                // "POST /pair-verify: 401" and the device never worked again.
+                Stage($"stored pairing rejected ({ex.Message}) — re-pairing required");
+                throw new StalePairingException($"{address}", ex);
+            }
         }
         else
         {
@@ -154,9 +208,20 @@ public sealed class RaopSession : IAsyncDisposable
                     return resp.Body;
                 }, ct).ConfigureAwait(false);
             }
-            catch (RtspException ex) when (ex.StatusCode is 470 or 401)
+            // 470 and 401 are NOT the same thing and must not be conflated:
+            //   470 Connection Authorization Required — the receiver wants on-screen PIN
+            //       pairing (Apple TV). Answering with the PIN flow is correct.
+            //   401 Unauthorized — the receiver's access control refused this sender. A
+            //       HomePod has no screen and never shows a PIN, so starting the PIN flow here
+            //       fails instantly and tells the user nothing. Surfaced separately so the app
+            //       can name the exact setting to change.
+            catch (RtspException ex) when (ex.StatusCode == 470)
             {
                 throw new PairingRequiredException($"{address}");
+            }
+            catch (RtspException ex) when (ex.StatusCode == 401)
+            {
+                throw new ReceiverAccessDeniedException($"{address}");
             }
         }
 
@@ -270,28 +335,35 @@ public sealed class RaopSession : IAsyncDisposable
             peers.EnsureSuccess("SETPEERS");
         }
 
-        Stage("SETUP (stream: realtime ALAC 44.1/16/2)");
+        var streamDict = new Dictionary<string, object?>
+        {
+            ["type"] = _buffered ? 0x67L : 0x60L,   // 103 buffered vs 96 realtime
+            ["ct"] = 2L,                             // ALAC
+            ["spf"] = 352L,
+            ["sr"] = (long)SampleRate,
+            ["audioFormat"] = 0x40000L,              // ALAC/44100/16/2
+            ["audioMode"] = "default",
+            ["controlPort"] = (long)LocalPort(_controlSocket),
+            ["isMedia"] = true,
+            ["shk"] = _hap.AudioKey,
+            ["supportsDynamicStreamID"] = false,
+            ["streamConnectionID"] = unchecked((long)_streamConnectionId),
+        };
+        if (_buffered)
+            // Bound the receiver-side buffer so it can't over-buffer and inflate latency. In
+            // frames this is ~2 s of headroom — enough to ride out jitter, far less than the 8 MiB
+            // (~190 s!) that let the HomePod's latency creep toward 2 s.
+            streamDict["audioBufferSize"] = 88200L;
+        else
+        {
+            streamDict["latencyMax"] = (long)LatencyFrames;
+            streamDict["latencyMin"] = 11025L;
+        }
+
+        Stage($"SETUP (stream: {(_buffered ? "buffered" : "realtime")} ALAC 44.1/16/2)");
         var streamSetup = await PlistRequestAsync("SETUP", new Dictionary<string, object?>
         {
-            ["streams"] = new List<object?>
-            {
-                new Dictionary<string, object?>
-                {
-                    ["type"] = 0x60L,
-                    ["ct"] = 2L,                    // ALAC
-                    ["spf"] = 352L,
-                    ["sr"] = (long)SampleRate,
-                    ["audioFormat"] = 0x40000L,     // ALAC/44100/16/2
-                    ["audioMode"] = "default",
-                    ["controlPort"] = (long)LocalPort(_controlSocket),
-                    ["latencyMax"] = (long)LatencyFrames,
-                    ["latencyMin"] = 11025L,
-                    ["isMedia"] = true,
-                    ["shk"] = _hap.AudioKey,
-                    ["supportsDynamicStreamID"] = false,
-                    ["streamConnectionID"] = unchecked((long)_streamConnectionId),
-                },
-            },
+            ["streams"] = new List<object?> { streamDict },
         }, ct).ConfigureAwait(false);
 
         var stream = (streamSetup.GetValueOrDefault("streams") as List<object?>)?.FirstOrDefault()
@@ -301,9 +373,64 @@ public sealed class RaopSession : IAsyncDisposable
         _receiverData = new IPEndPoint(_rtsp.RemoteAddress, (int)dataPort);
         _receiverControl = new IPEndPoint(_rtsp.RemoteAddress, (int)theirControl);
         Stage($"stream ports: data={dataPort} control={theirControl} — session live");
-        // No SETRATEANCHORTIME for realtime streams: playback is driven by the sync
-        // packets alone (owntone parity). Anchoring rtpTime=start at "now" would
-        // contradict the sync timeline by the full latency window.
+
+        if (_buffered)
+        {
+            // Buffered audio flows over a TCP connection to the receiver's data port. The
+            // receiver buffers ahead and plays from the shared timeline anchored at stream start
+            // (SendBufferedAnchorAsync) — NOT here, because connect finishes seconds before audio
+            // flows, and for a group every member must share ONE anchor to play in sync.
+            _audioTcp = new TcpClient();
+            await _audioTcp.ConnectAsync(_rtsp.RemoteAddress, (int)dataPort, ct).ConfigureAwait(false);
+            _audioTcp.NoDelay = true;
+            _audioTcpStream = _audioTcp.GetStream();
+            Stage($"buffered audio TCP connected → {_rtsp.RemoteAddress}:{dataPort}");
+        }
+        // Realtime streams need no SETRATEANCHORTIME: playback is driven by the sync packets
+        // alone (owntone parity).
+    }
+
+    /// <summary>
+    /// Sends SETRATEANCHORTIME to start buffered playback anchored to <paramref name="anchorNanos"/>
+    /// (a PTP grandmaster time). Called once at stream start; for a group the SAME anchorNanos and
+    /// the shared start timestamp are used for every member, so all speakers render the same sample
+    /// at the same instant. The sample with RTP time <see cref="_startTimestamp"/> plays at the anchor.
+    /// </summary>
+    public async Task SendBufferedAnchorAsync(ulong anchorNanos, CancellationToken ct)
+    {
+        var (secs, frac) = AnchorNetworkTime(anchorNanos);
+        var payload = new Dictionary<string, object?>
+        {
+            ["rate"] = 1L,
+            ["rtpTime"] = (long)_startTimestamp,
+            ["networkTimeTimelineID"] = unchecked((long)(_ptp?.ClockId ?? 0)),
+            ["networkTimeSecs"] = unchecked((long)secs),
+            ["networkTimeFrac"] = unchecked((long)frac),
+            ["networkTimeFlags"] = 0L,
+        };
+        var resp = await _rtsp.RequestAsync(new RtspRequest
+        {
+            Method = "SETRATEANCHORTIME",
+            Uri = RtspUri,
+            Body = BinaryPlist.Write(payload),
+            ContentType = "application/x-apple-binary-plist",
+        }, ct).ConfigureAwait(false);
+        resp.EnsureSuccess("SETRATEANCHORTIME");
+        Stage($"anchored buffered timeline (rtpTime={_startTimestamp})");
+    }
+
+    /// <summary>
+    /// Splits a PTP time in nanoseconds into the SETRATEANCHORTIME <c>networkTimeSecs</c> and
+    /// <c>networkTimeFrac</c> fields. The fraction is 2^-64 fixed-point (NOT nanoseconds): the
+    /// receiver recovers nanoseconds as <c>(frac * 1e9) &gt;&gt; 64</c> (shairport-sync
+    /// <c>handle_setrateanchori</c>). Emitting raw nanoseconds anchors the stream in the past and
+    /// the receiver plays nothing — the bug this encoding fixes.
+    /// </summary>
+    internal static (ulong Secs, ulong Frac) AnchorNetworkTime(ulong nanos)
+    {
+        ulong secs = nanos / 1_000_000_000UL;
+        ulong frac = (ulong)(((UInt128)(nanos % 1_000_000_000UL) << 64) / 1_000_000_000UL);
+        return (secs, frac);
     }
 
     private static IPAddress? ExtractTimingPeer(Dictionary<string, object?> sessionSetup)
@@ -338,17 +465,124 @@ public sealed class RaopSession : IAsyncDisposable
 
     // ------------------------------------------------------------ streaming
 
+    /// <summary>
+    /// Convenience for a lone session: prepare, (buffered) anchor at now + lead, start the pump.
+    /// Groups use the split API so every member shares one anchor computed at the last instant.
+    /// </summary>
     public async Task StartStreamingAsync(IAudioSource source, double volumeDb = -18)
     {
+        await PrepareStreamingAsync(volumeDb).ConfigureAwait(false);
+        if (_buffered)
+            await SendBufferedAnchorAsync(MonotonicClock.NowNanoseconds + BufferedLeadNanos, _cts.Token)
+                .ConfigureAwait(false);
+        StartPump(source);
+    }
+
+    /// <summary>
+    /// Completes every RTSP round-trip needed before audio can flow (volume, crypto, keep-alive)
+    /// — deliberately separated from <see cref="StartPump"/>. The buffered anchor promises the
+    /// receiver "sample 0 plays at anchor + lead", so every await that sits between computing the
+    /// anchor and sending the first packet is stolen jitter headroom. Sequencing all RTSP work
+    /// first makes the receiver's headroom deterministic: headroom = lead − anchor-RTT.
+    /// </summary>
+    public async Task PrepareStreamingAsync(double volumeDb = -18)
+    {
         await SetVolumeAsync(volumeDb, _cts.Token).ConfigureAwait(false);
-
-        _audioCrypto = new AudioPacketCrypto(_hap!.AudioKey);
-        _loops.Add(Task.Run(() => SyncLoopAsync(_cts.Token)));
         _loops.Add(Task.Run(() => FeedbackLoopAsync(_cts.Token)));
+        if (_buffered)
+        {
+            // Buffered mode: the anchor + PTP clock drive playback, so no per-second RTP sync
+            // packets are sent. Audio flows over the TCP data channel.
+            _bufferedCrypto = new BufferedAudioPacket(_hap!.AudioKey);
+        }
+        else
+        {
+            _audioCrypto = new AudioPacketCrypto(_hap!.AudioKey);
+        }
+    }
 
-        _pumpThread = new Thread(() => AudioPump(source)) { IsBackground = true, Priority = ThreadPriority.Highest };
+    /// <summary>Starts the audio pump — no network awaits, so a buffered pump begins sending
+    /// within milliseconds of its anchor. Call after <see cref="PrepareStreamingAsync"/> (and,
+    /// for buffered, after <see cref="SendBufferedAnchorAsync"/>).</summary>
+    public void StartPump(IAudioSource source)
+    {
+        if (_buffered)
+        {
+            _pumpThread = new Thread(() => BufferedAudioPump(source)) { IsBackground = true, Priority = ThreadPriority.Highest };
+        }
+        else
+        {
+            _loops.Add(Task.Run(() => SyncLoopAsync(_cts.Token)));
+            _pumpThread = new Thread(() => AudioPump(source)) { IsBackground = true, Priority = ThreadPriority.Highest };
+        }
         _pumpThread.Start();
-        Stage("streaming started");
+        Stage($"streaming started ({(_buffered ? "buffered" : "realtime")})");
+    }
+
+    /// <summary>
+    /// Buffered audio pump: paces PCM at real time, ALAC-frames it, and writes length-prefixed
+    /// buffered packets to the TCP data channel. Playback timing is set once by the anchor, so
+    /// real-time pacing keeps the receiver's buffer at the ~0.5 s lead established there.
+    /// </summary>
+    private void BufferedAudioPump(IAudioSource source)
+    {
+        timeBeginPeriod(1);
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var writeSw = new Stopwatch();
+            Span<short> samples = stackalloc short[352 * 2];
+            uint seq = 0;
+            // TCP send-health window (~15 s): a stalled Write means Wi-Fi backpressure — the
+            // receiver is starving no matter how healthy the capture side is. Reported via
+            // Stage so live runs can attribute dropouts to the correct pipeline stage.
+            long windowMaxStallMs = 0, windowTotalStallMs = 0;
+            const int WindowPackets = 1880;
+            while (!_stopped)
+            {
+                double dueMs = _framesSent * 352000.0 / SampleRate;
+                double nowMs = sw.Elapsed.TotalMilliseconds;
+                if (nowMs < dueMs)
+                {
+                    int sleep = (int)(dueMs - nowMs);
+                    if (sleep >= 2) Thread.Sleep(sleep - 1);
+                    continue;
+                }
+
+                source.Read(samples);
+                byte[] alac = AlacFramer.WrapPcmFrame(samples);
+                uint ts = (uint)(_startTimestamp + (ulong)_framesSent * 352);
+                byte[] frame = _bufferedCrypto!.BuildFrame(seq & 0xFFFFFF, ts, _ssrc, alac);
+                try
+                {
+                    writeSw.Restart();
+                    _audioTcpStream!.Write(frame, 0, frame.Length);
+                    long stallMs = writeSw.ElapsedMilliseconds;
+                    windowTotalStallMs += stallMs;
+                    if (stallMs > windowMaxStallMs) windowMaxStallMs = stallMs;
+                }
+                catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+                {
+                    if (_stopped) return;
+                    if (Interlocked.Increment(ref _audioSendFailures) == 1)
+                        Stage($"BUFFERED AUDIO SEND FAILING: {ex.Message}");
+                    RaiseFaulted(ex);
+                    return;
+                }
+                seq++;
+                Interlocked.Increment(ref _framesSent);
+                if (seq % WindowPackets == 0)
+                {
+                    if (windowMaxStallMs > 20)
+                        Stage($"tcp send health: max stall {windowMaxStallMs}ms, total {windowTotalStallMs}ms in ~15s window");
+                    windowMaxStallMs = windowTotalStallMs = 0;
+                }
+            }
+        }
+        finally
+        {
+            timeEndPeriod(1);
+        }
     }
 
     public async Task SetVolumeAsync(double db, CancellationToken ct)
@@ -357,7 +591,7 @@ public sealed class RaopSession : IAsyncDisposable
         {
             Method = "SET_PARAMETER",
             Uri = RtspUri,
-            Body = System.Text.Encoding.ASCII.GetBytes($"volume: {db:F6}\r\n"),
+            Body = System.Text.Encoding.ASCII.GetBytes(VolumeControl.FormatVolumeBody(db)),
             ContentType = "text/parameters",
         }, ct).ConfigureAwait(false);
         resp.EnsureSuccess("SET_PARAMETER volume");
@@ -377,6 +611,33 @@ public sealed class RaopSession : IAsyncDisposable
             Headers = { ["RTP-Info"] = $"rtptime={CurrentRtpTimestamp}" },
         }, ct).ConfigureAwait(false);
         resp.EnsureSuccess("SET_PARAMETER metadata");
+    }
+
+    /// <summary>
+    /// Reports playback position so the receiver can draw its progress bar / scrubber (D2).
+    /// The RAOP <c>progress</c> parameter is three RTP timestamps — <c>start/current/end</c> —
+    /// on the session's own audio timeline, so they are derived from <see cref="_startTimestamp"/>
+    /// rather than wall time.
+    /// </summary>
+    public async Task SendProgressAsync(TimeSpan position, TimeSpan duration, CancellationToken ct = default)
+    {
+        uint now = CurrentRtpTimestamp;
+        // "start" is where the current track began on our timeline: now − elapsed.
+        uint start = (uint)(now - (long)(position.TotalSeconds * SampleRate));
+        uint end = duration > TimeSpan.Zero
+            ? (uint)(start + (long)(duration.TotalSeconds * SampleRate))
+            : now;
+
+        var resp = await _rtsp.RequestAsync(new RtspRequest
+        {
+            Method = "SET_PARAMETER",
+            Uri = RtspUri,
+            Body = System.Text.Encoding.ASCII.GetBytes(
+                string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"progress: {start}/{now}/{end}\r\n")),
+            ContentType = "text/parameters",
+        }, ct).ConfigureAwait(false);
+        resp.EnsureSuccess("SET_PARAMETER progress");
     }
 
     /// <summary>Sends cover artwork (JPEG or PNG) to the receiver's Now Playing UI.</summary>
@@ -428,8 +689,16 @@ public sealed class RaopSession : IAsyncDisposable
                 catch (SocketException ex)
                 {
                     if (_stopped) return;
-                    if (Interlocked.Increment(ref _audioSendFailures) == 1)
-                        Stage($"AUDIO SEND FAILING: {ex.SocketErrorCode} → {_receiverData}");
+                    // A UDP send failure here is terminal for this session — the receiver has
+                    // gone (ICMP port-unreachable after it tore its session down, adapter
+                    // disabled, Wi-Fi dropped). Previously the loop swallowed this and kept
+                    // pumping forever: Faulted never fired, so StreamController never
+                    // reconnected, and the destination sat silent while the UI still showed it
+                    // streaming. Report and stop, exactly as the buffered pump does.
+                    Interlocked.Increment(ref _audioSendFailures);
+                    Stage($"audio send failed: {ex.SocketErrorCode} → {_receiverData}");
+                    RaiseFaulted(ex);
+                    return;
                 }
                 _sequence++;
                 Interlocked.Increment(ref _framesSent);
@@ -804,6 +1073,9 @@ public sealed class RaopSession : IAsyncDisposable
         try { await Task.WhenAll(_loops).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
         catch (Exception) { /* loops end on cancellation/socket close */ }
         _audioCrypto?.Dispose();
+        _bufferedCrypto?.Dispose();
+        _audioTcpStream?.Dispose();
+        _audioTcp?.Dispose();
         _timingSocket?.Dispose();
         _controlSocket?.Dispose();
         _audioSocket?.Dispose();

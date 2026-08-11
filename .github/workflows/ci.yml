@@ -6,42 +6,140 @@ on:
   pull_request:
     branches: [master]
 
+# Least privilege: CI only ever needs to read the repository.
+permissions:
+  contents: read
+
+# Every action is pinned to a full commit SHA, with its released version in the trailing comment.
+#
+# A tag is a mutable pointer: whoever controls the action's repository can move v4 to any commit
+# at any time, and every workflow that referenced it starts running that code on its next run —
+# on a runner that has already checked out this repository and holds a token for it. That is the
+# supply-chain attack that has actually happened to Actions users, more than once. A SHA cannot
+# be moved.
+#
+# The comment is not decoration: it is the only thing that makes these lines reviewable, and it is
+# what lets Dependabot (see .github/dependabot.yml) propose an upgrade as a readable diff rather
+# than an opaque hash swap. Keep it accurate whenever a pin changes.
+
+# A newer push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
-    name: Build & test
-    runs-on: windows-latest
+    name: Build & test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+
+    # Two pinned runner images rather than windows-latest.
+    #
+    # `windows-latest` is a moving alias: GitHub repoints it to a new image on its own schedule,
+    # so a green build can turn red — or, worse, a real regression can turn green — because the
+    # OS, SDK, or Media Foundation stack underneath changed and nothing in this repository did.
+    # Naming the images makes that a deliberate, reviewable commit.
+    #
+    # Two of them because WinPlay sits directly on OS behaviour that differs across releases:
+    # WASAPI process loopback, IAudioClient3 low-latency negotiation, Desktop Duplication, and
+    # the mDNS/multicast stack. Testing one image would only prove it works on one Windows.
+    #
+    # windows-2025 is the Server 2025 image, sharing its servicing branch with Windows 11 24H2/25H2
+    # — the closest CI can get to what users actually run. windows-2022 is the oldest image still
+    # supported, which is the floor the product claims to work on.
+    strategy:
+      fail-fast: false          # a failure on one image must not hide the other's result
+      matrix:
+        runner: [windows-2025, windows-2022]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Set up .NET 8
-        uses: actions/setup-dotnet@v4
+      # Both SDKs: projects TARGET net8.0 (the LTS runtime users get), while the newer SDK
+      # provides the toolchain the maintainer builds and verifies with locally. Installing
+      # both keeps CI and local builds on identical compiler behaviour.
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
+      # Restored explicitly rather than via WinPlay.slnx so the job never depends on which
+      # SDK resolves first — .slnx support is SDK-version-sensitive, and a restore failure
+      # here would be a confusing way to learn that.
       - name: Restore
         run: |
           dotnet restore src/WinPlay.Core/WinPlay.Core.csproj
           dotnet restore src/WinPlay.Capture/WinPlay.Capture.csproj
+          dotnet restore src/WinPlay.Diagnostics/WinPlay.Diagnostics.csproj
           dotnet restore tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj
-          dotnet restore tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj
           dotnet restore src/WinPlay.App/WinPlay.App.csproj
+          dotnet restore tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj
+          dotnet restore tests/WinPlay.Capture.Tests/WinPlay.Capture.Tests.csproj
+          dotnet restore tests/WinPlay.Diagnostics.Tests/WinPlay.Diagnostics.Tests.csproj
 
-      - name: Build core, capture, CLI
-        run: |
-          dotnet build tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj -c Release --no-restore
+      # WinPlay holds a zero-warning bar; -warnaserror makes CI enforce it rather
+      # than relying on anyone reading build output.
+      - name: Build core, capture, diagnostics, CLI
+        run: dotnet build tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj -c Release --no-restore -warnaserror
 
       - name: Build app (WinUI)
-        run: dotnet build src/WinPlay.App/WinPlay.App.csproj -c Release -p:Platform=x64 --no-restore
+        run: dotnet build src/WinPlay.App/WinPlay.App.csproj -c Release -p:Platform=x64 --no-restore -warnaserror
 
-      - name: Test
-        run: dotnet test tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj -c Release --logger "trx;LogFileName=test-results.trx"
+      # Every test project runs. Listing them explicitly (rather than the solution) keeps
+      # the platform-specific ones building against the right RID.
+      - name: Test — Core
+        run: dotnet test tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj -c Release --logger "trx;LogFileName=core.trx"
+
+      - name: Test — Capture
+        run: dotnet test tests/WinPlay.Capture.Tests/WinPlay.Capture.Tests.csproj -c Release -p:Platform=x64 --logger "trx;LogFileName=capture.trx"
+
+      - name: Test — Diagnostics
+        run: dotnet test tests/WinPlay.Diagnostics.Tests/WinPlay.Diagnostics.Tests.csproj -c Release --logger "trx;LogFileName=diagnostics.trx"
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-results
-          path: '**/test-results.trx'
+          # Per-runner name: a matrix uploading to one artifact name collides and the second job
+          # fails, which reads as a test failure rather than a packaging mistake.
+          name: test-results-${{ matrix.runner }}
+          path: '**/TestResults/*.trx'
           if-no-files-found: ignore
+
+  installer:
+    name: Installer compiles
+    # Pinned for the same reason as the build matrix: the image that proves the installer
+    # compiles must not change without a commit saying so.
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Both SDKs: projects TARGET net8.0 (the LTS runtime users get), while the newer SDK
+      # provides the toolchain the maintainer builds and verifies with locally. Installing
+      # both keeps CI and local builds on identical compiler behaviour.
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # The installer is part of the product: a broken .iss must fail CI, not the release.
+      - name: Publish self-contained app
+        run: >
+          dotnet publish src/WinPlay.App/WinPlay.App.csproj
+          -c Release -r win-x64 --self-contained true -p:Platform=x64
+          -o publish/win-x64
+
+      - name: Compile installer (both architectures)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          foreach ($arch in @('x64', 'arm64')) {
+            & $iscc "/DSourceDir=$(Resolve-Path publish/win-x64)" "/DAppVersion=0.0.0-ci" "/DArch=$arch" installer/winplay.iss
+            if ($LASTEXITCODE -ne 0) { throw "ISCC failed for $arch with exit code $LASTEXITCODE" }
+          }

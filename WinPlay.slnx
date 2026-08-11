@@ -3,9 +3,12 @@
     <Project Path="src/WinPlay.App/WinPlay.App.csproj" />
     <Project Path="src/WinPlay.Core/WinPlay.Core.csproj" />
     <Project Path="src/WinPlay.Capture/WinPlay.Capture.csproj" />
+    <Project Path="src/WinPlay.Diagnostics/WinPlay.Diagnostics.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/WinPlay.Core.Tests/WinPlay.Core.Tests.csproj" />
+    <Project Path="tests/WinPlay.Diagnostics.Tests/WinPlay.Diagnostics.Tests.csproj" />
+    <Project Path="tests/WinPlay.Capture.Tests/WinPlay.Capture.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj" />

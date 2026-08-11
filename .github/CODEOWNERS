@@ -1,0 +1,12 @@
+# Every change is reviewed by the maintainer. Combined with branch protection, this makes
+# review on the default branch automatic rather than remembered.
+*                       @dineshdhotrad
+
+# Areas where a mistake is expensive and review should be especially deliberate:
+# protocol/crypto correctness, the release pipeline, and the security posture.
+/src/WinPlay.Core/Hap/       @dineshdhotrad
+/src/WinPlay.Core/Fairplay/  @dineshdhotrad
+/src/WinPlay.Core/Raop/      @dineshdhotrad
+/.github/workflows/          @dineshdhotrad
+/installer/                  @dineshdhotrad
+/SECURITY.md                 @dineshdhotrad

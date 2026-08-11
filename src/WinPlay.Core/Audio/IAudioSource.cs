@@ -11,6 +11,28 @@ public interface IAudioSource : IDisposable
     void Read(Span<short> interleavedStereo);
 }
 
+/// <summary>
+/// A capture source that can drop any audio buffered so far and resume from the live edge. Called
+/// just before streaming starts so the first samples sent are fresh — stale buffer accumulated
+/// during connect is pure latency, so discarding it tightens the end-to-end delay without shrinking
+/// the receiver's jitter buffer.
+/// </summary>
+public interface IFlushableAudioSource
+{
+    void FlushToLive();
+}
+
+/// <summary>
+/// Capture-health counters for live attribution of audible problems: <c>UnderrunFrames</c> is
+/// silence served in place of not-yet-arrived audio (benign while nothing renders),
+/// <c>LateFrames</c> is real audio dropped because it arrived after its position played (actual
+/// audible damage), and <c>GapJumps</c> counts true-silence writer jumps.
+/// </summary>
+public interface ICaptureDiagnostics
+{
+    (long UnderrunFrames, long LateFrames, long GapJumps) CaptureStats { get; }
+}
+
 /// <summary>Phase-continuous sine generator — protocol soak tests without touching WASAPI.</summary>
 public sealed class SineAudioSource(double frequencyHz = 440.0, double amplitude = 0.25) : IAudioSource
 {

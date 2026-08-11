@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- Local-only structured logging. Serilog + the File sink ONLY: no network/HTTP/Seq sink
+       is referenced, so there is no code path that could exfiltrate logs (zero telemetry).
+       Serilog is Apache-2.0 — compatible with WinPlay's GPL-3.0-or-later license. -->
+  <ItemGroup>
+    <PackageReference Include="Serilog" Version="4.2.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+  </ItemGroup>
+
+</Project>

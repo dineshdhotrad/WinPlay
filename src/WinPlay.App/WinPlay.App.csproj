@@ -8,23 +8,60 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Platforms>x64;ARM64</Platforms>
     <Platform Condition="'$(Platform)' == '' or '$(Platform)' == 'AnyCPU'">x64</Platform>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- The runtime identifier must track the selected platform. Previously hard-coded to
+         win-x64, which silently mis-targeted the ARM64 artifact (I1 / A1). -->
+    <RuntimeIdentifier Condition="'$(Platform)' == 'ARM64'">win-arm64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(Platform)' != 'ARM64'">win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
     <EnableMsixTooling>true</EnableMsixTooling>
-    <!-- Unpackaged + self-contained WinAppSDK: the exe runs directly during development;
-         MSIX packaging is Phase 6. -->
+    <!-- Unpackaged and fully self-contained: bundle BOTH the .NET runtime (SelfContained)
+         and the Windows App SDK runtime (WindowsAppSDKSelfContained) so a fresh machine with
+         neither installed can still launch WinPlay. A missing/mismatched WinAppSDK runtime
+         bootstrapper is the primary root cause of the "opens and closes" failure (A1). -->
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
+    <!-- Use our custom entry point (Program.Main) for single-instance activation
+         redirection (A3) instead of the XAML-generated Main. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <!-- Embed the app icon in the EXE so Windows shows the WinPlay logo in Explorer,
          Task Manager, Alt-Tab, and permission / UAC dialogs. -->
     <ApplicationIcon>Assets\winplay.ico</ApplicationIcon>
+
+    <!-- Runtime profile for a long-lived BACKGROUND app. WinPlay spends almost all of its
+         life idle in the tray, so it is tuned for small resident footprint and fast start
+         rather than peak throughput.
+         · Workstation GC (never Server): Server GC allocates a heap per core — on a 16-core
+           machine that is a large, permanent footprint for an app that barely allocates.
+         · Concurrent/background GC stays ON deliberately: the audio pump has a hard real-time
+           deadline (a 352-frame packet every ~8 ms) and a blocking gen-2 pause would be
+           audible. Latency wins over the small memory saving of turning it off.
+         · RetainVMGarbageCollection=false returns freed segments to the OS instead of holding
+           address space for reuse.
+         · ReadyToRun precompiles the hot startup path: less JIT work, so the tray icon appears
+           sooner and less JIT-generated code stays resident. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Pinned to 1.7.x deliberately. Windows App SDK 2.x was trialled to get the in-tree
+         SystemBackdropElement (which would let the acrylic animate with the flyout instead of
+         popping in). It COMPILES cleanly, but at runtime the 2.x-generated x:Bind Connect()
+         casts the wrong element and every window load throws InvalidCastException — reproduced
+         on a clean obj/bin, and still reproduced after reverting the XAML, which is what
+         identified the SDK bump itself as the cause rather than the new element. Revisit with a
+         focused spike; a cosmetic gain is not worth shipping a window that cannot open. -->
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.*" />
+    <!-- Power / session / logoff notifications (SystemLifecycleWatcher). These live outside
+         the shared framework on .NET 8 and must be referenced explicitly. -->
+    <PackageReference Include="Microsoft.Win32.SystemEvents" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -34,6 +71,7 @@
   <ItemGroup>
     <ProjectReference Include="..\WinPlay.Core\WinPlay.Core.csproj" />
     <ProjectReference Include="..\WinPlay.Capture\WinPlay.Capture.csproj" />
+    <ProjectReference Include="..\WinPlay.Diagnostics\WinPlay.Diagnostics.csproj" />
   </ItemGroup>
 
 </Project>

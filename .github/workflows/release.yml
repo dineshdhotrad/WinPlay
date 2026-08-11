@@ -10,7 +10,10 @@ permissions:
 jobs:
   release:
     name: Build installer & portable (${{ matrix.rid }})
-    runs-on: windows-latest
+    # Pinned deliberately: this image builds the binaries users install. Which Windows and
+    # which toolchain produced a release must be a reviewable fact, not whatever GitHub
+    # repointed the alias to that week.
+    runs-on: windows-2025
     # Job-level env so the signing steps' `if:` can see whether a cert secret is set.
     env:
       SIGNING_PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
@@ -26,10 +29,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up .NET 8
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: '8.0.x'
 
@@ -64,7 +67,13 @@ jobs:
         run: |
           choco install innosetup --no-progress -y
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc "/DSourceDir=$(Resolve-Path publish/${{ matrix.rid }})" "/DAppVersion=${{ steps.ver.outputs.version }}" installer/winplay.iss
+          # The installer must know its target architecture: ARM64 binaries cannot run under
+          # x64 emulation, so the wrong-arch install has to be refused rather than half-work.
+          $arch = if ('${{ matrix.rid }}' -eq 'win-arm64') { 'arm64' } else { 'x64' }
+          & $iscc "/DSourceDir=$(Resolve-Path publish/${{ matrix.rid }})" `
+                  "/DAppVersion=${{ steps.ver.outputs.version }}" `
+                  "/DArch=$arch" installer/winplay.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Move-Item installer/dist/WinPlay-*-Setup.exe "WinPlay-${{ steps.ver.outputs.version }}-${{ matrix.rid }}-Setup.exe"
 
       - name: Sign installer
@@ -82,7 +91,7 @@ jobs:
         run: Compress-Archive -Path publish/${{ matrix.rid }}/* -DestinationPath "WinPlay-${{ steps.ver.outputs.version }}-${{ matrix.rid }}-portable.zip"
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             WinPlay-*-${{ matrix.rid }}-Setup.exe
