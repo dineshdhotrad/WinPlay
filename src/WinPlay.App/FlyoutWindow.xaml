@@ -5,8 +5,9 @@
     xmlns:vm="using:WinPlay.App.ViewModels"
     Title="WinPlay">
 
-    <Grid Padding="16,14,16,12" RowSpacing="12">
+        <Grid Padding="16,14,16,12" RowSpacing="12">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
@@ -21,8 +22,36 @@
                 Style="{StaticResource BodyStrongTextBlockStyle}" />
         </StackPanel>
 
+        <!-- Now Playing: the PC's current media, Control Center-style (F1) -->
+        <Grid Grid.Row="1" ColumnSpacing="12" Padding="12,10" CornerRadius="{ThemeResource OverlayCornerRadius}"
+              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+              Visibility="{x:Bind ViewModel.HasNowPlaying, Mode=OneWay}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Border Grid.Column="0" Width="40" Height="40" CornerRadius="6"
+                    Background="{ThemeResource ControlFillColorSecondaryBrush}">
+                <Grid>
+                    <FontIcon Glyph="&#xEC4F;" FontSize="16"
+                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                              Visibility="{x:Bind ViewModel.HasNoArt, Mode=OneWay}" />
+                    <Border CornerRadius="6">
+                        <Image Source="{x:Bind ViewModel.NowPlayingArt, Mode=OneWay}" Stretch="UniformToFill" />
+                    </Border>
+                </Grid>
+            </Border>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1">
+                <TextBlock Text="{x:Bind ViewModel.NowPlayingTitle, Mode=OneWay}"
+                           Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="{x:Bind ViewModel.NowPlayingArtist, Mode=OneWay}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+        </Grid>
+
         <!-- Device list -->
-        <Grid Grid.Row="1" MinHeight="120">
+        <Grid Grid.Row="2" MinHeight="120">
             <StackPanel
                 Spacing="10"
                 VerticalAlignment="Center"
@@ -51,7 +80,7 @@
                                     HorizontalAlignment="Stretch"
                                     HorizontalContentAlignment="Stretch"
                                     Padding="12,10"
-                                    CornerRadius="10"
+                                    CornerRadius="{ThemeResource OverlayCornerRadius}"
                                     ToolTipService.ToolTip="{x:Bind MembersTooltip, Mode=OneWay}">
                                     <Grid ColumnSpacing="14">
                                         <Grid.ColumnDefinitions>
@@ -59,7 +88,20 @@
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
-                                        <FontIcon Grid.Column="0" Glyph="{x:Bind Glyph, Mode=OneWay}" FontSize="18" VerticalAlignment="Center" />
+                                        <!-- Any row that is more than one speaker — a stereo pair
+                                             or a multi-room group — renders as two layered
+                                             speakers, the second behind and dimmed. Depicting the
+                                             actual object beats borrowing an unrelated icon: the
+                                             two glyphs tried previously for a group drew it as a
+                                             crowd of people and as rack hardware. -->
+                                        <Grid Grid.Column="0" VerticalAlignment="Center" Width="22" Height="20">
+                                            <FontIcon Glyph="{x:Bind PairGlyph, Mode=OneWay}" FontSize="15"
+                                                      Opacity="0.55" Margin="0,0,9,4"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                      Visibility="{x:Bind HasPairGlyph, Mode=OneWay}" />
+                                            <FontIcon Glyph="{x:Bind Glyph, Mode=OneWay}" FontSize="18"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                        </Grid>
                                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1">
                                             <TextBlock Text="{x:Bind DisplayName, Mode=OneWay}" Style="{StaticResource BodyTextBlockStyle}" TextTrimming="CharacterEllipsis" />
                                             <TextBlock Text="{x:Bind Subtitle, Mode=OneWay}" Style="{StaticResource CaptionTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" />
@@ -88,13 +130,13 @@
                                         <ProgressRing Grid.Column="2" Width="16" Height="16" VerticalAlignment="Center" IsActive="{x:Bind IsBusy, Mode=OneWay}" Visibility="{x:Bind IsBusy, Mode=OneWay}" />
                                     </Grid>
                                     <StackPanel Orientation="Horizontal" Spacing="8" Margin="32,0,0,0">
-                                        <ToggleButton IsChecked="{x:Bind IsAudioChecked, Mode=TwoWay}" CornerRadius="8" Padding="12,6">
+                                        <ToggleButton IsChecked="{x:Bind IsAudioChecked, Mode=TwoWay}" CornerRadius="{ThemeResource ControlCornerRadius}" Padding="12,6">
                                             <StackPanel Orientation="Horizontal" Spacing="7">
                                                 <FontIcon Glyph="&#xE767;" FontSize="14" />
                                                 <TextBlock Text="Audio" Style="{StaticResource CaptionTextBlockStyle}" />
                                             </StackPanel>
                                         </ToggleButton>
-                                        <ToggleButton IsChecked="{x:Bind IsMirrorChecked, Mode=TwoWay}" CornerRadius="8" Padding="12,6">
+                                        <ToggleButton IsChecked="{x:Bind IsMirrorChecked, Mode=TwoWay}" CornerRadius="{ThemeResource ControlCornerRadius}" Padding="12,6">
                                             <StackPanel Orientation="Horizontal" Spacing="7">
                                                 <FontIcon Glyph="{x:Bind MirrorGlyph, Mode=OneWay}" FontSize="14" />
                                                 <TextBlock Text="Mirror" Style="{StaticResource CaptionTextBlockStyle}" />
@@ -120,10 +162,10 @@
         </Grid>
 
         <TextBlock
-            Grid.Row="2"
+            Grid.Row="3"
             Text="{x:Bind ViewModel.Status, Mode=OneWay}"
             Style="{StaticResource CaptionTextBlockStyle}"
             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
             TextTrimming="CharacterEllipsis" />
-    </Grid>
+        </Grid>
 </Window>

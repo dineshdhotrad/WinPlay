@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  # NuGet packages. Grouped so a routine bump is one reviewable PR rather than six.
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      vortice:
+        patterns: ["Vortice.*"]
+      test-stack:
+        patterns: ["xunit*", "Microsoft.NET.Test.Sdk"]
+      serilog:
+        patterns: ["Serilog*"]
+
+  # GitHub Actions. Kept current so the workflows do not drift onto deprecated runners
+  # or unmaintained action versions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ci)"

@@ -84,6 +84,21 @@ public sealed class AirPlayDevice
     public bool SupportsAudio =>
         Features.HasFlag(AirPlayFeatures.SupportsAirPlayAudio) || RaopPort is not null;
 
+    /// <summary>
+    /// Whether this receiver can DISPLAY an on-screen pairing code, and may therefore be sent
+    /// through the PIN-pairing flow.
+    ///
+    /// <para>A HomePod has no display: it authenticates with transient pairing and never shows a
+    /// code, so prompting for one can only fail. Screens belong to Apple TVs and AirPlay 2 TVs;
+    /// a third-party receiver qualifies only if it advertises video/screen support, which
+    /// implies it has one.</para>
+    /// </summary>
+    public bool CanDisplayPairingPin =>
+        Subtype != AirPlayDeviceSubtype.HomePod
+        && (Subtype == AirPlayDeviceSubtype.AppleTv
+            || Features.HasFlag(AirPlayFeatures.SupportsAirPlayScreen)
+            || Features.HasFlag(AirPlayFeatures.SupportsAirPlayVideoV1));
+
     public static string NormalizeDeviceId(string raw) =>
         raw.Replace(":", "").Replace("-", "").Trim().ToUpperInvariant();
 }

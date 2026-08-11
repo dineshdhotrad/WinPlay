@@ -206,7 +206,19 @@ public static class BinaryPlist
         for (long i = 0; i < numObjects; i++)
             offsets[i] = (long)ReadBe(plist.Slice((int)(offsetTableOffset + i * offsetIntSize), offsetIntSize));
 
-        return ReadObject(plist, offsets, refSize, (int)topObject, depth: 0);
+        try
+        {
+            return ReadObject(plist, offsets, refSize, (int)topObject, depth: 0);
+        }
+        catch (Exception ex) when (ex is ArgumentOutOfRangeException or IndexOutOfRangeException
+                                      or ArgumentException or OverflowException)
+        {
+            // Every parse failure must present as FormatException. Callers guard against
+            // malformed plists with `catch (FormatException)`; a stray range exception escaping
+            // instead killed the background loop that was parsing — including the 2 s /feedback
+            // keep-alive, which silently ended playback ~30 s later with nothing surfaced.
+            throw new FormatException($"malformed plist: {ex.Message}", ex);
+        }
     }
 
     /// <summary>Convenience: read and require a top-level dictionary.</summary>
@@ -263,7 +275,7 @@ public static class BinaryPlist
             }
             case 0x6: // UTF-16BE string
             {
-                int count = ReadCount(buf, ref p, info);
+                int count = ReadCount(buf, ref p, info, bytesPerElement: 2);
                 return Encoding.BigEndianUnicode.GetString(buf.Slice(p, count * 2));
             }
             case 0x8: // uid
@@ -271,7 +283,7 @@ public static class BinaryPlist
             case 0xA: // array
             case 0xC: // set — treat as array
             {
-                int count = ReadCount(buf, ref p, info);
+                int count = ReadCount(buf, ref p, info, bytesPerElement: refSize);
                 var list = new List<object?>(count);
                 for (int i = 0; i < count; i++)
                 {
@@ -282,7 +294,8 @@ public static class BinaryPlist
             }
             case 0xD: // dict
             {
-                int count = ReadCount(buf, ref p, info);
+                // Each entry costs a key ref AND a value ref.
+                int count = ReadCount(buf, ref p, info, bytesPerElement: refSize * 2);
                 var dict = new Dictionary<string, object?>(count);
                 for (int i = 0; i < count; i++)
                 {
@@ -299,14 +312,42 @@ public static class BinaryPlist
         }
     }
 
-    private static int ReadCount(ReadOnlySpan<byte> buf, ref int p, int info)
+    /// <summary>
+    /// Reads an element count and validates it against what the buffer can actually hold.
+    ///
+    /// <para>The count comes straight off the wire, so it must never be trusted for sizing.
+    /// Unvalidated it allowed two attacks from any device on the LAN — a few hundred bytes
+    /// declaring a count near <see cref="int.MaxValue"/> caused a multi-gigabyte
+    /// <c>new List(count)</c>/<c>new Dictionary(count)</c> allocation, and oversized counts made
+    /// the following <c>Slice</c> throw <see cref="ArgumentOutOfRangeException"/> rather than
+    /// <see cref="FormatException"/>, escaping call sites that only guard against malformed
+    /// plists. Since every element consumes at least <paramref name="bytesPerElement"/> bytes, a
+    /// count that cannot fit in the remaining buffer is definitionally invalid.</para>
+    /// </summary>
+    private static int ReadCount(ReadOnlySpan<byte> buf, ref int p, int info, int bytesPerElement = 1)
     {
-        if (info != 0x0F) return info;
-        byte marker = buf[p++];
-        if ((marker >> 4) != 0x1) throw new FormatException("length marker is not an int");
-        int size = 1 << (marker & 0x0F);
-        int count = (int)ReadBe(buf.Slice(p, size));
-        p += size;
+        int count;
+        if (info != 0x0F)
+        {
+            count = info;
+        }
+        else
+        {
+            if (p >= buf.Length) throw new FormatException("length marker overruns buffer");
+            byte marker = buf[p++];
+            if ((marker >> 4) != 0x1) throw new FormatException("length marker is not an int");
+            int size = 1 << (marker & 0x0F);
+            if (size > 8 || p + size > buf.Length) throw new FormatException("length field overruns buffer");
+            ulong raw = ReadBe(buf.Slice(p, size));
+            if (raw > int.MaxValue) throw new FormatException($"implausible element count {raw}");
+            count = (int)raw;
+            p += size;
+        }
+
+        if (count < 0) throw new FormatException("negative element count");
+        long required = (long)count * Math.Max(1, bytesPerElement);
+        if (required > buf.Length - p)
+            throw new FormatException($"element count {count} exceeds the remaining {buf.Length - p} bytes");
         return count;
     }
 

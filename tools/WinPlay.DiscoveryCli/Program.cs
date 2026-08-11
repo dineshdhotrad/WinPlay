@@ -12,7 +12,7 @@ using WinPlay.Core.Rtsp;
 // WinPlay protocol test harness.
 //   discover [--seconds N] [--verbose]   enumerate receivers + collapsed picker (default)
 //   info --to <name>                     GET /info against a receiver, dump the plist
-//   play --to <name>[,<name>…] [--minutes M] [--volume dB] [--tone|--lr-test] [--ntp]
+//   play --to <name>[,<name>…] [--minutes M] [--volume dB] [--tone|--lr-test] [--ntp] [--buffered]
 //       stream to one or more picker entries; a stereo pair/group automatically gets a
 //       coordinated per-member session set (shared PTP grandmaster). Source is system
 //       loopback by default, 440 Hz with --tone, L/R channel test with --lr-test.
@@ -37,8 +37,115 @@ return command switch
     "play" => await PlayAsync(),
     "pair" => await PairAsync(),
     "mirror" => await MirrorAsync(),
+    "audio" => Audio(),
+    "trust" => Trust(),
+    "diagnostics" => await DiagnosticsAsync(),
     _ => Fail($"unknown command '{command}'"),
 };
+
+// Writes the redacted diagnostics bundle (H2): logs + environment, with pairing credentials
+// excluded by construction and all key material scrubbed.
+async Task<int> DiagnosticsAsync()
+{
+    var identities = new ReceiverIdentityStore().List();
+    var sections = new Dictionary<string, string>
+    {
+        ["pinned-receivers"] = identities.Count == 0
+            ? "(none)"
+            : string.Join(Environment.NewLine, identities.Select(p =>
+                $"{p.Name} id={p.DeviceId} pk={p.PublicKey} lastSeen={p.LastSeenUtc}")),
+    };
+    string path = await WinPlay.Diagnostics.BugReportBundle.CreateAsync(
+        GetOpt("--out"), extraSections: sections);
+    Console.WriteLine($"diagnostics bundle written to {path}");
+    Console.WriteLine("pairing credentials are never included; all key material is redacted");
+    return 0;
+}
+
+// Inspects and manages pinned receiver identities (G1). `trust` lists them;
+// `trust --forget <deviceId>` drops one so a genuinely reset device can be trusted again.
+int Trust()
+{
+    var store = new ReceiverIdentityStore();
+    if (GetOpt("--forget") is { } forgetId)
+    {
+        Console.WriteLine(store.Forget(forgetId)
+            ? $"forgot pinned identity for {forgetId} — the next connection will trust it afresh"
+            : $"no pinned identity for {forgetId}");
+        return 0;
+    }
+
+    var pins = store.List();
+    if (pins.Count == 0)
+    {
+        Console.WriteLine("no receiver identities pinned yet");
+        return 0;
+    }
+    Console.WriteLine($"=== {pins.Count} pinned receiver identit{(pins.Count == 1 ? "y" : "ies")} ===");
+    foreach (var (deviceId, publicKey, name, lastSeen) in pins)
+        Console.WriteLine($"  ● {(name.Length > 0 ? name : "(unnamed)"),-24} {deviceId}  pk={publicKey[..16]}…  last seen {lastSeen}");
+    return 0;
+}
+
+// Prints the default render endpoint's mute/volume; `--unmute` clears a stuck mute. Endpoint
+// loopback captures AFTER the mute, so a muted endpoint records (and streams) silence.
+int Audio()
+{
+    var endpoint = new WinPlay.Core.Audio.WasapiEndpointController();
+    // null = whatever is currently the default; the app pins a device id instead, so that a
+    // restore always targets the endpoint it actually muted.
+    string? deviceId = endpoint.DefaultRenderDeviceId;
+    if (!endpoint.TryGetState(deviceId, out bool mute, out float vol))
+        return Fail("no default render endpoint");
+    Console.WriteLine($"default render endpoint: id={deviceId ?? "(none)"}  mute={mute}  volume={vol:P0}");
+
+    // Report the capture period the engine actually grants (B6 acceptance: <= 10 ms).
+    try
+    {
+        using var probe = new WinPlay.Core.Audio.ProcessLoopbackAudioSource((uint)Environment.ProcessId);
+        double ms = probe.CapturePeriodMs;
+        Console.WriteLine($"requested buffer: {ms:F2} ms");
+        Console.WriteLine($"  low-latency: {probe.CaptureLatencyStatus}");
+
+        // The requested buffer is not the delivery cadence: with event-driven capture the engine
+        // signals at ITS period. Measure the real inter-callback interval — that is what B6's
+        // "capture-side latency" actually means.
+        var gaps = new List<double>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        double last = -1;
+        probe.SampleBatchObserved += () =>
+        {
+            double now = sw.Elapsed.TotalMilliseconds;
+            if (last >= 0) lock (gaps) gaps.Add(now - last);
+            last = now;
+        };
+        System.Threading.Thread.Sleep(3000);
+        lock (gaps)
+        {
+            if (gaps.Count > 2)
+            {
+                gaps.Sort();
+                Console.WriteLine($"  measured callback cadence: median {gaps[gaps.Count / 2]:F2} ms, "
+                    + $"p95 {gaps[(int)(gaps.Count * 0.95)]:F2} ms over {gaps.Count} callbacks");
+            }
+            else
+            {
+                Console.WriteLine("  measured callback cadence: no audio rendering, nothing to measure");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"capture period: probe failed ({ex.Message})");
+    }
+    if (HasFlag("--unmute"))
+    {
+        endpoint.TrySetMute(deviceId, false);
+        endpoint.TryGetState(deviceId, out bool m2, out float v2);
+        Console.WriteLine($"→ after unmute: mute={m2}  volume={v2:P0}");
+    }
+    return 0;
+}
 
 async Task<int> MirrorAsync()
 {
@@ -105,48 +212,41 @@ async Task<(List<PickerEntry> Entries, List<string> Missing, IReadOnlyList<AirPl
     using var browser = new AirPlayBrowser();
     browser.Start();
 
+    // A target name may be a collapsed picker row ("Study" — the pair's group public name,
+    // which only exists once every member's TXT record arrives) OR a raw device name.
+    // Resolution therefore goes picker-entry first, device second, and the wait loop keeps
+    // browsing until every name resolves to an entry whose members are all connectable.
+    PickerEntry? Resolve(IReadOnlyList<AirPlayDevice> snap, List<PickerEntry> picker, string n) =>
+        picker.FirstOrDefault(e => string.Equals(e.DisplayName, n, StringComparison.OrdinalIgnoreCase))
+        ?? picker.FirstOrDefault(e => e.DisplayName.Contains(n, StringComparison.OrdinalIgnoreCase))
+        ?? (MatchDevice(snap, n) is { } d
+            ? picker.FirstOrDefault(e => e.Members.Any(m => m.DeviceId == d.DeviceId))
+            : null);
+
     IReadOnlyList<AirPlayDevice> snapshot = [];
+    List<PickerEntry> collapsed = [];
     var deadline = DateTime.UtcNow.AddSeconds(seconds);
     while (DateTime.UtcNow < deadline)
     {
         snapshot = browser.Snapshot();
-        if (names.All(n => MatchDevice(snapshot, n) is { Addresses.Count: > 0 })) break;
-        await Task.Delay(400);
-    }
-
-    // Grace period for group/pair members of the found targets to appear.
-    var memberDeadline = DateTime.UtcNow.AddSeconds(4);
-    while (DateTime.UtcNow < memberDeadline)
-    {
-        snapshot = browser.Snapshot();
-        bool complete = names
-            .Select(n => MatchDevice(snapshot, n))
-            .All(d => d is null
-                || (d.TightSyncId is null && d.GroupId is null)
-                || snapshot.Any(o => o.DeviceId != d.DeviceId && o.Addresses.Count > 0
-                    && ((d.TightSyncId is not null && o.TightSyncId == d.TightSyncId)
-                        || (d.GroupId is not null && o.GroupId == d.GroupId))));
-        if (complete) break;
+        collapsed = DevicePicker.Collapse(snapshot);
+        bool ready = names.All(n => Resolve(snapshot, collapsed, n) is { } e
+            && e.Members.All(m => m.Addresses.Count > 0));
+        if (ready) break;
         await Task.Delay(400);
     }
 
     snapshot = browser.Snapshot();
-    var picker = DevicePicker.Collapse(snapshot);
+    collapsed = DevicePicker.Collapse(snapshot);
     var entries = new List<PickerEntry>();
     var missing = new List<string>();
     foreach (string n in names)
     {
-        var device = MatchDevice(snapshot, n);
-        var entry = device is null ? null
-            : picker.FirstOrDefault(e => e.Members.Any(m => m.DeviceId == device.DeviceId));
+        var entry = Resolve(snapshot, collapsed, n);
         if (entry is null)
-        {
             missing.Add(n);
-        }
         else if (!entries.Any(e => e.Key == entry.Key))
-        {
             entries.Add(entry);
-        }
     }
     return (entries, missing, snapshot);
 }
@@ -183,16 +283,42 @@ async Task<int> PlayAsync()
         Console.Error.WriteLine($"device '{lost}' not found on the LAN");
     if (entries.Count == 0) return 1;
 
-    IAudioSource MakeSource() => HasFlag("--lr-test")
-        ? new ChannelTestAudioSource()
-        : HasFlag("--tone")
-            ? new SineAudioSource()
-            : new LoopbackAudioSource();
+    var captureSources = new List<ICaptureDiagnostics>();
+    IAudioSource MakeSource()
+    {
+        if (HasFlag("--lr-test")) return new ChannelTestAudioSource();
+        if (HasFlag("--tone")) return new SineAudioSource();
+        // Same capture path as the app: process-loopback (event-driven, ~10 ms cadence),
+        // excluding our own output. NAudio endpoint loopback (~50 ms polled) is the fallback.
+        IAudioSource capture;
+        try { capture = new ProcessLoopbackAudioSource((uint)Environment.ProcessId); }
+        catch (Exception) { capture = new LoopbackAudioSource(); }
+        if (capture is ICaptureDiagnostics diag) captureSources.Add(diag);
+        return capture;
+    }
     Console.WriteLine(HasFlag("--lr-test")
         ? "source: L/R channel test (4 s left 440 Hz ↔ 4 s right 880 Hz)"
-        : HasFlag("--tone") ? "source: 440 Hz test tone" : "source: system audio (WASAPI loopback)");
+        : HasFlag("--tone") ? "source: 440 Hz test tone" : "source: system audio (process loopback)");
+
+    // DACP control endpoint (D3): advertised as iTunes_Ctrl_<DACP-ID> so the receiver can send
+    // play/pause/next back. Kept in the CLI for live protocol verification against real devices;
+    // the app additionally routes these onto the Windows media session.
+    using var dacp = new WinPlay.Core.Raop.DacpServer(
+        WinPlay.Core.Raop.DacpIdentity.DacpId, WinPlay.Core.Raop.DacpIdentity.ActiveRemote);
+    using var dacpMdns = new WinPlay.Core.Mdns.MdnsClient();
+    dacpMdns.Start();
+    dacp.Diagnostic += d => Console.WriteLine($"  [dacp] {d}");
+    dacp.CommandReceived += (origin, c) => Console.WriteLine($"  [dacp] ◀ REMOTE COMMAND FROM {origin}: {c}");
+    dacp.VolumeRequested += (origin, db) => Console.WriteLine($"  [dacp] ◀ REMOTE VOLUME FROM {origin}: {db:F1} dB");
+    dacp.Start();
+    using var dacpAd = new WinPlay.Core.Mdns.MdnsServiceAdvertiser(dacpMdns, "_dacp._tcp.local",
+        dacp.ServiceInstanceName, dacp.Port,
+        new Dictionary<string, string> { ["txtvers"] = "1", ["Ver"] = "131077" });
+    dacpAd.Diagnostic += d => Console.WriteLine($"  [dacp] {d}");
+    dacpAd.Start();
 
     var credentialStore = new CredentialStore();
+    var identityStore = new ReceiverIdentityStore();
     var groups = new List<GroupSession>();
     try
     {
@@ -209,11 +335,14 @@ async Task<int> PlayAsync()
                 Console.WriteLine($"  !! {entry.DisplayName}: no member has an IPv4 address yet");
                 continue;
             }
+            bool buffered = HasFlag("--buffered");
             Console.WriteLine($"● {entry.DisplayName} [{entry.Kind}] → "
                 + string.Join(" + ", members.Select(member => $"{member.Name}@{member.Address}"))
-                + $"  (timing {(members[0].UsePtp ? "PTP, we are grandmaster" : "NTP")})");
+                + $"  (timing {(members[0].UsePtp ? "PTP, we are grandmaster" : "NTP")}"
+                + $"{(buffered ? ", buffered ~0.5s" : ", realtime ~2s")})");
             groups.Add(await GroupSession.ConnectAsync(members,
-                (memberName, stage) => Console.WriteLine($"  [{DateTime.Now:HH:mm:ss}] [{memberName}] {stage}")));
+                (memberName, stage) => Console.WriteLine($"  [{DateTime.Now:HH:mm:ss}] [{memberName}] {stage}"),
+                buffered: buffered, identities: identityStore));
         }
         if (groups.Count == 0) return 1;
 
@@ -235,8 +364,22 @@ async Task<int> PlayAsync()
             await Task.Delay(TimeSpan.FromSeconds(15));
             Console.WriteLine($"  [{DateTime.Now:HH:mm:ss}] alive — "
                 + string.Join(", ", groups.Select(g => $"{string.Join("+", g.MemberNames)}: {g.Elapsed:hh\\:mm\\:ss} ({g.FramesSent} pkts)")));
+            // Capture health. LATE frames are the real damage (music that arrived after its
+            // moment passed → audible cuts); underruns alone can be benign silence (nothing
+            // rendering). Attribution decides where to fix, so both are reported.
+            for (int i = 0; i < captureSources.Count; i++)
+            {
+                var (underruns, late, gaps) = captureSources[i].CaptureStats;
+                if (underruns > 0 || late > 0 || gaps > 0)
+                    Console.WriteLine($"  [capture {i}] LATE(dropped music)={late} (~{late / 44100.0:F2}s), silence-fill={underruns} (~{underruns / 44100.0:F2}s), gap jumps={gaps}");
+            }
         }
         Console.WriteLine("time limit reached — tearing down");
+        for (int i = 0; i < captureSources.Count; i++)
+        {
+            var (underruns, late, gaps) = captureSources[i].CaptureStats;
+            Console.WriteLine($"  [capture {i}] final: LATE(dropped music)={late} (~{late / 44100.0:F2}s), silence-fill={underruns} (~{underruns / 44100.0:F2}s), gap jumps={gaps}");
+        }
         foreach (var group in groups)
             await group.StopAsync();
     }

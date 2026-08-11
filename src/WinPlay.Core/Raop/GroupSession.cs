@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using WinPlay.Core.Audio;
 using WinPlay.Core.Discovery;
 using WinPlay.Core.Hap;
+using WinPlay.Core.Ptp;
 
 namespace WinPlay.Core.Raop;
 
@@ -25,7 +27,8 @@ public sealed class GroupSession : IAsyncDisposable
     /// open sessions to, but the ATV must know as clock-synced peers or it stays silent).
     /// </summary>
     public sealed record Member(string Name, IPAddress Address, int Port, bool UsePtp,
-        HapPairingCredentials? Credentials = null, IReadOnlyList<IPAddress>? ExtraPeers = null);
+        HapPairingCredentials? Credentials = null, IReadOnlyList<IPAddress>? ExtraPeers = null,
+        string? DeviceId = null, string? PublicKey = null);
 
     private readonly List<(Member Member, RaopSession Session)> _members;
     private BroadcastAudioSource? _broadcast;
@@ -85,7 +88,8 @@ public sealed class GroupSession : IAsyncDisposable
             if (Ip(device) is not { } address) continue;
             members.Add(new Member(device.Name, address, device.AirPlayPort ?? 7000,
                 device.Features.HasFlag(AirPlayFeatures.SupportsPtp),
-                credentialStore?.Load(device.DeviceId)));
+                credentialStore?.Load(device.DeviceId),
+                DeviceId: device.DeviceId, PublicKey: device.PublicKey));
         }
         return members;
     }
@@ -95,8 +99,16 @@ public sealed class GroupSession : IAsyncDisposable
     /// and tolerated — the group plays on the members that accepted. Throws only when
     /// no member could be connected.
     /// </summary>
+    /// <param name="identities">
+    /// When supplied, every member's advertised long-term identity is checked against the pinned
+    /// one BEFORE any audio flows (G1). A mismatch fails that member with
+    /// <see cref="ReceiverIdentityChangedException"/> rather than streaming to an impostor; the
+    /// pin is (re)written only after the connection is accepted, so a rejected impostor can never
+    /// overwrite a good pin.
+    /// </param>
     public static async Task<GroupSession> ConnectAsync(IReadOnlyList<Member> members,
-        Action<string, string>? stageChanged = null, CancellationToken ct = default)
+        Action<string, string>? stageChanged = null, CancellationToken ct = default, bool buffered = false,
+        ReceiverIdentityStore? identities = null, string? activeRemote = null)
     {
         if (members.Count == 0)
             throw new ArgumentException("group has no connectable members", nameof(members));
@@ -104,6 +116,18 @@ public sealed class GroupSession : IAsyncDisposable
         var connected = new List<(Member, RaopSession)>();
         var failures = new List<Exception>();
         var allAddresses = members.Select(m => m.Address).ToList();
+        // A buffered group shares ONE start timestamp, so the same audio sample carries the same
+        // RTP time on every member and (with the shared stream-start anchor) plays in lock-step.
+        uint? sharedStart = buffered ? (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue) : null;
+
+        // Connecting a group is a multi-step operation that can be abandoned partway: the
+        // caller's connect timeout can fire, or the user can hit Stop, while member 2 of 3 is
+        // still handshaking. Members connected so far are FULLY live — bound UDP sockets, an
+        // open encrypted RTSP connection, and running timing/control loops that root the
+        // session object — so abandoning them leaks sockets and threads for the process
+        // lifetime. Everything already connected is therefore disposed before rethrowing.
+        try
+        {
         foreach (var member in members)
         {
             var peers = allAddresses.Where(a => !a.Equals(member.Address))
@@ -112,16 +136,43 @@ public sealed class GroupSession : IAsyncDisposable
                 .ToList();
             try
             {
+                // Identity gate (G1): refuse BEFORE connecting, so an impostor never receives
+                // audio, metadata, or a pairing attempt.
+                if (identities is not null && member.DeviceId is { Length: > 0 } deviceId)
+                {
+                    var check = identities.Check(deviceId, member.PublicKey);
+                    if (check.Trust == IdentityTrust.Mismatch)
+                        throw new ReceiverIdentityChangedException(member.Name, check.PinnedKey, check.PresentedKey);
+                    if (check.Trust == IdentityTrust.FirstUse)
+                        stageChanged?.Invoke(member.Name, "new receiver — trusting its identity on first use");
+                }
+
                 var session = await RaopSession.ConnectAsync(member.Address, member.Port,
                     member.UsePtp, peers, stage => stageChanged?.Invoke(member.Name, stage), ct,
-                    member.Credentials).ConfigureAwait(false);
+                    member.Credentials, buffered && member.UsePtp, sharedStart, activeRemote).ConfigureAwait(false);
                 connected.Add((member, session));
+
+                // Pin only after the receiver accepted us.
+                if (identities is not null && member.DeviceId is { Length: > 0 } acceptedId)
+                    identities.Pin(acceptedId, member.PublicKey, member.Name);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failures.Add(ex);
                 stageChanged?.Invoke(member.Name, $"member failed to connect: {ex.Message}");
             }
+        }
+        }
+        catch
+        {
+            // Cancellation (or anything else escaping the per-member handler) must not strand
+            // the sessions already established.
+            foreach (var (_, session) in connected)
+            {
+                try { await session.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception) { /* already tearing down */ }
+            }
+            throw;
         }
 
         if (connected.Count == 0)
@@ -139,13 +190,53 @@ public sealed class GroupSession : IAsyncDisposable
     public async Task StartStreamingAsync(IAudioSource source, double volumeDb = -18)
     {
         _broadcast = new BroadcastAudioSource(source);
-        foreach (var (member, session) in _members)
+
+        // Create EVERY branch at the same live position, before any pump reads, so frame index N
+        // maps to the identical absolute audio sample on every member — the basis for sample-exact
+        // group sync (tightens realtime too, and is required for buffered).
+        var streams = _members
+            .Select(ms => (ms.Member, ms.Session, Branch: _broadcast.CreateBranch()))
+            .ToList();
+
+        // Deterministic start sequence. The buffered anchor promises "sample 0 plays at
+        // anchor + lead", so every network round-trip between computing the anchor and the first
+        // packet is stolen jitter headroom. Therefore:
+        //   1. ALL preparatory RTSP work (volume, crypto, keep-alive) completes first;
+        //   2. the capture flushes to the live edge (stale buffer is pure latency);
+        //   3. ONE shared anchor is computed and sent to every buffered member concurrently —
+        //      shared start timestamp + shared anchor ⇒ every speaker plays the same sample at
+        //      the same PTP instant (the group-echo fix);
+        //   4. pumps start with zero awaits after the anchor.
+        // Result: headroom = lead − anchor-RTT, run after run, not "lead minus whatever setup ate".
+        await Task.WhenAll(streams.Select(async s =>
         {
-            try
-            {
-                await session.StartStreamingAsync(_broadcast.CreateBranch(), volumeDb).ConfigureAwait(false);
-            }
+            try { await s.Session.PrepareStreamingAsync(volumeDb).ConfigureAwait(false); }
             catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                StageChanged?.Invoke(s.Member.Name, $"stream prepare failed: {ex.Message}");
+            }
+        })).ConfigureAwait(false);
+
+        (source as IFlushableAudioSource)?.FlushToLive();
+
+        var buffered = streams.Where(s => s.Session.IsBuffered).ToList();
+        if (buffered.Count > 0)
+        {
+            ulong anchorNanos = MonotonicClock.NowNanoseconds + RaopSession.BufferedLeadNanos;
+            await Task.WhenAll(buffered.Select(async s =>
+            {
+                try { await s.Session.SendBufferedAnchorAsync(anchorNanos, default).ConfigureAwait(false); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    StageChanged?.Invoke(s.Member.Name, $"anchor failed: {ex.Message}");
+                }
+            })).ConfigureAwait(false);
+        }
+
+        foreach (var (member, session, branch) in streams)
+        {
+            try { session.StartPump(branch); }
+            catch (Exception ex)
             {
                 StageChanged?.Invoke(member.Name, $"streaming start failed: {ex.Message}");
             }
@@ -177,6 +268,16 @@ public sealed class GroupSession : IAsyncDisposable
         }
     }
 
+    /// <summary>Pushes playback position to every member's progress bar (best effort).</summary>
+    public async Task SendProgressAsync(TimeSpan position, TimeSpan duration, CancellationToken ct = default)
+    {
+        foreach (var (_, session) in _members)
+        {
+            try { await session.SendProgressAsync(position, duration, ct).ConfigureAwait(false); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { /* non-fatal */ }
+        }
+    }
+
     /// <summary>Pushes cover artwork to every member's Now Playing UI (best effort).</summary>
     public async Task SendArtworkAsync(byte[] image, string contentType = "image/jpeg", CancellationToken ct = default)
     {
@@ -189,14 +290,33 @@ public sealed class GroupSession : IAsyncDisposable
 
     public async Task StopAsync()
     {
-        foreach (var (_, session) in _members)
-            await session.StopAsync().ConfigureAwait(false);
+        await Task.WhenAll(_members.Select(m => IsolatedAsync(() => m.Session.StopAsync())))
+            .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Tears every member down, together and independently.
+    ///
+    /// <para>Independently because a member's failure is not the other members' business. Disposed
+    /// in a plain loop, one throw — entirely plausible mid-teardown across a sleep or a Wi-Fi
+    /// switch — abandoned every member after it, leaving a real speaker in the room still playing
+    /// while the app showed everything stopped, until the process exited.</para>
+    ///
+    /// <para>Together because teardown runs against the suspend deadline, and a polite goodbye
+    /// (TEARDOWN, then draining the pumps) takes seconds per member. Sequentially, a stereo pair
+    /// alone could not finish in time.</para>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        foreach (var (_, session) in _members)
-            await session.DisposeAsync().ConfigureAwait(false);
+        await Task.WhenAll(_members.Select(m => IsolatedAsync(() => m.Session.DisposeAsync().AsTask())))
+            .ConfigureAwait(false);
         _broadcast?.Dispose();
+    }
+
+    /// <summary>Runs one member's teardown so a failure cannot take the others with it.</summary>
+    private static async Task IsolatedAsync(Func<Task> teardown)
+    {
+        try { await teardown().ConfigureAwait(false); }
+        catch (Exception) { /* nothing left to salvage for this member; the rest still must stop */ }
     }
 }

@@ -12,4 +12,14 @@ public interface IMdnsTransport : IDisposable
     void Start();
 
     void Query(IReadOnlyList<(string Name, DnsType Type, bool UnicastResponse)> questions);
+
+    /// <summary>
+    /// Sends an already-serialised DNS message. <paramref name="unicastTo"/> targets a single
+    /// peer (answering a QU question); when null the message is multicast to every joined
+    /// interface. Used by <see cref="MdnsServiceAdvertiser"/> to publish WinPlay's own services.
+    /// </summary>
+    void Send(byte[] packet, IPEndPoint? unicastTo = null);
+
+    /// <summary>IPv4 addresses of the interfaces this transport is active on (for A records).</summary>
+    IReadOnlyList<IPAddress> LocalAddresses { get; }
 }

@@ -21,4 +21,9 @@
     <ProjectReference Include="..\WinPlay.Core\WinPlay.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Expose internal capture helpers (recovery/backoff, resolution negotiation) to tests. -->
+    <InternalsVisibleTo Include="WinPlay.Capture.Tests" />
+  </ItemGroup>
+
 </Project>

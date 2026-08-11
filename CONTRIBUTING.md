@@ -18,7 +18,7 @@ findings, device compatibility notes, code — are welcome.
 ```powershell
 git clone https://github.com/dineshdhotrad/WinPlay.git
 cd WinPlay
-dotnet test tests/WinPlay.Core.Tests   # should be green before you start
+./build.ps1                            # should be green before you start
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.

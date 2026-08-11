@@ -33,6 +33,16 @@ public sealed partial class FlyoutWindow : Window
         ViewModel = viewModel;
         InitializeComponent();
 
+        // Window-level acrylic. Note the known consequence: a window backdrop is composited by
+        // the window, so it appears at full opacity the moment the window is shown while only
+        // the content animates — the glass does not fade in with the card.
+        //
+        // The documented fix is an in-tree SystemBackdropElement (Windows App SDK 2.x), which
+        // WAS attempted here: it compiles, but at runtime it shifts the x:Bind connection ids
+        // so the generated Connect() casts the wrong element and the window throws
+        // InvalidCastException on load. Verified twice, including after a full obj/bin clean.
+        // A cosmetic improvement is not worth a window that cannot open, so the window backdrop
+        // stays until that codegen interaction is understood.
         SystemBackdrop = new DesktopAcrylicBackdrop();
 
         IntPtr hwnd = WindowNative.GetWindowHandle(this);
@@ -52,7 +62,29 @@ public sealed partial class FlyoutWindow : Window
             ref cornerPreference, sizeof(int));
 
         Activated += OnActivated;
+        _appWindow.Closing += OnAppWindowClosing;
         ViewModel.RequestPin = ShowPinDialogAsync;
+    }
+
+    private bool _allowClose;
+
+    /// <summary>Raised once the flyout has finished hiding — the app is idle again.</summary>
+    public event Action? Hidden;
+
+    /// <summary>Permits the window to close for real — called during an explicit Quit.</summary>
+    public void AllowClose() => _allowClose = true;
+
+    /// <summary>
+    /// The flyout is WinPlay's persistent window (this is a tray app). Never actually close
+    /// it — hide instead — so closing the flyout (Alt+F4, system menu) can never terminate
+    /// the app by dropping the open-window count to zero (A2). Only the tray "Quit" exits,
+    /// via Application.Exit() after <see cref="AllowClose"/>.
+    /// </summary>
+    private void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        if (_allowClose) return;
+        args.Cancel = true;
+        if (_appWindow.IsVisible) AnimateAndHide();
     }
 
     /// <summary>
@@ -149,6 +181,19 @@ public sealed partial class FlyoutWindow : Window
     private Visual RootVisual => ElementCompositionPreview.GetElementVisual((UIElement)Content);
 
     /// <summary>
+    /// Whether the user wants animations at all. Read fresh each time rather than cached, because
+    /// it is a setting someone can change while the app is running and expect to take effect.
+    /// </summary>
+    private static bool AnimationsEnabled
+    {
+        get
+        {
+            try { return new Windows.UI.ViewManagement.UISettings().AnimationsEnabled; }
+            catch { return true; }   // never let a settings read stop the window from opening
+        }
+    }
+
+    /// <summary>
     /// Smooth, continuous fade + slide-up + subtle grow of the whole card, one ease-out
     /// curve over the full motion (no spring bounce). WinUI's system acrylic backdrop is
     /// painted by the window and can't be animated as content, so the card content carries
@@ -159,12 +204,39 @@ public sealed partial class FlyoutWindow : Window
         var root = (UIElement)Content;
         var visual = RootVisual;
         var c = visual.Compositor;
-        var size = root.ActualSize;
+
+        // Honour the system's animation setting before doing anything else. Windows exposes this
+        // in Settings > Accessibility > Visual effects, and people turn it off for real reasons —
+        // motion sensitivity, or an older machine where every animation is a stutter. An app that
+        // animates anyway is not being polished, it is ignoring an explicit instruction.
+        if (!AnimationsEnabled)
+        {
+            visual.Opacity = 1f;
+            visual.Offset = Vector3.Zero;
+            visual.Scale = Vector3.One;
+            return;
+        }
+
+        // Size the transform origin from the WINDOW, not from ActualSize.
+        //
+        // The window has only just been shown, so on the first open the content has not been laid
+        // out yet and ActualSize is still (0,0). That put CenterPoint at the top-left corner, so
+        // the very first time the user ever opened the picker it grew out of the corner of the
+        // screen instead of rising off the tray — the one opening that forms their impression of
+        // the app, and the only one that looked broken. The window's own client size is known the
+        // moment it is positioned, and is the same size the content is about to take.
+        float dpiScale = GetDpiForWindow(WindowNative.GetWindowHandle(this)) / 96f;
+        var client = _appWindow.ClientSize;
+        var size = root.ActualSize.X > 0
+            ? root.ActualSize
+            : new Vector2(client.Width / dpiScale, client.Height / dpiScale);
         visual.CenterPoint = new Vector3(size.X / 2f, size.Y, 0f); // grow from the bottom (tray) edge
 
-        // Windows-flyout-like ease-out: fast start, gentle deceleration, no overshoot.
-        var ease = c.CreateCubicBezierEasingFunction(new Vector2(0.1f, 0.9f), new Vector2(0.2f, 1f));
-        var dur = TimeSpan.FromMilliseconds(300);
+        // Fluent's actual entrance curve — "Fast Out, Slow In", cubic-bezier(0,0,0,1). Windows
+        // uses this for anything spawning into view; its very fast start and long tail are what
+        // make platform motion recognisable. (Previous values here were invented and read wrong.)
+        var ease = c.CreateCubicBezierEasingFunction(new Vector2(0f, 0f), new Vector2(0f, 1f));
+        var dur = TimeSpan.FromMilliseconds(300); // matches the platform's "expand" duration
 
         visual.Opacity = 0f;
         var fade = c.CreateScalarKeyFrameAnimation();
@@ -195,8 +267,18 @@ public sealed partial class FlyoutWindow : Window
         _closing = true;
         var visual = RootVisual;
         var c = visual.Compositor;
-        var ease = c.CreateCubicBezierEasingFunction(new Vector2(0.4f, 0f), new Vector2(1f, 1f)); // ease-in
-        var dur = TimeSpan.FromMilliseconds(130);
+
+        if (!AnimationsEnabled)
+        {
+            _appWindow.Hide();
+            Hidden?.Invoke();
+            return;
+        }
+
+        // Fluent's actual exit curve — "Slow Out, Fast In", cubic-bezier(1,0,1,1) — and the
+        // platform's 150 ms exit duration. Exits are deliberately faster than entrances.
+        var ease = c.CreateCubicBezierEasingFunction(new Vector2(1f, 0f), new Vector2(1f, 1f));
+        var dur = TimeSpan.FromMilliseconds(150);
 
         var batch = c.CreateScopedBatch(CompositionBatchTypes.Animation);
 
@@ -210,7 +292,9 @@ public sealed partial class FlyoutWindow : Window
 
         batch.Completed += (_, _) =>
         {
-            if (_closing) _appWindow.Hide();
+            if (!_closing) return;
+            _appWindow.Hide();
+            Hidden?.Invoke();
         };
         batch.End();
     }

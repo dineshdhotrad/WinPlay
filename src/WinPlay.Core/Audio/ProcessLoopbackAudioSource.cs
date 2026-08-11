@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+using System.Diagnostics;
 using NAudio.CoreAudioApi;
 using NAudio.Dsp;
 
@@ -6,27 +7,29 @@ namespace WinPlay.Core.Audio;
 
 /// <summary>
 /// Adapts <see cref="ProcessLoopbackCapture"/> (push, float) to the <see cref="IAudioSource"/>
-/// pull interface. Captures at the system mix rate (usually 48 kHz) and resamples to
-/// 44.1 kHz stereo with a WDL resampler — feeding 48 kHz samples straight into a 44.1 kHz
-/// ALAC stream is what produced audible static, so the resample is mandatory. Captured
-/// audio lands in a ring buffer; <see cref="Read"/> drains it and zero-fills on underrun so
-/// the RTP pump runs at a constant rate.
+/// pull interface. Captures at the system mix rate (usually 48 kHz) and resamples to 44.1 kHz
+/// stereo — feeding 48 kHz samples straight into a 44.1 kHz ALAC stream produces audible
+/// static, so the resample is mandatory.
+///
+/// <para>Captured audio lands in a <see cref="PositionedCaptureRing"/>, which locks content to
+/// the wall-clock timeline: capture jitter can never shift audio later on the RTP timeline, so
+/// end-to-end latency stays constant instead of creeping (critical for anchored buffered
+/// streams, which set their timeline once). <see cref="Read"/> zero-fills positions that have
+/// no data yet, keeping the RTP pump at a constant rate.</para>
 /// </summary>
-public sealed class ProcessLoopbackAudioSource : IAudioSource
+public sealed class ProcessLoopbackAudioSource : IAudioSource, IFlushableAudioSource, ICaptureDiagnostics
 {
-    private const int TargetRate = 44100;
+    private const int TargetRate = PositionedCaptureRing.SampleRate;
 
     private readonly ProcessLoopbackCapture _capture;
     private readonly WdlResampler _resampler;
+    private readonly PositionedCaptureRing _ring = new();
     private readonly int _sourceRate;
     private readonly int _sourceChannels;
 
-    private readonly short[] _ring = new short[TargetRate * 2 * 4]; // 4 s stereo
-    private readonly object _lock = new();
-    private int _ringRead, _ringWrite, _ringCount;
-
     private float[] _stereoScratch = new float[16384];
     private float[] _resampleOut = new float[16384];
+    private short[] _shortScratch = new short[16384];
 
     public ProcessLoopbackAudioSource(uint excludeProcessId)
     {
@@ -62,6 +65,7 @@ public sealed class ProcessLoopbackAudioSource : IAudioSource
 
     private void OnSamples(float[] samples, int frames)
     {
+        SampleBatchObserved?.Invoke();
         if (frames == 0) return;
 
         // Downmix to interleaved stereo float.
@@ -75,46 +79,59 @@ public sealed class ProcessLoopbackAudioSource : IAudioSource
             _stereoScratch[f * 2 + 1] = r;
         }
 
-        // Resample source-rate → 44.1 kHz stereo.
+        // The ring reconciles the write position against wall time (true-gap jumps) and hands
+        // back a drift-corrected output rate so device-clock skew never accumulates.
+        double outRate = _ring.BeginWrite(Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency);
+        _resampler.SetRates(_sourceRate, outRate);
+
         int needed = _resampler.ResamplePrepare(frames, 2, out float[] inBuf, out int inOff);
         Array.Copy(_stereoScratch, 0, inBuf, inOff, Math.Min(needed, frames) * 2);
-        int maxOut = (int)((long)frames * TargetRate / _sourceRate) + 16;
+        int maxOut = (int)((long)frames * (long)Math.Ceiling(outRate) / _sourceRate) + 32;
         EnsureCapacity(ref _resampleOut, maxOut * 2);
         int produced = _resampler.ResampleOut(_resampleOut, 0, frames, maxOut, 2);
 
-        lock (_lock)
+        EnsureCapacity(ref _shortScratch, produced * 2);
+        for (int i = 0; i < produced * 2; i++)
         {
-            for (int i = 0; i < produced * 2; i++)
-            {
-                float v = Math.Clamp(_resampleOut[i], -1f, 1f);
-                _ring[_ringWrite] = (short)(v * 32767f);
-                _ringWrite = (_ringWrite + 1) % _ring.Length;
-                if (_ringCount == _ring.Length)
-                    _ringRead = (_ringRead + 1) % _ring.Length; // overwrite oldest
-                else
-                    _ringCount++;
-            }
+            float v = Math.Clamp(_resampleOut[i], -1f, 1f);
+            _shortScratch[i] = (short)(v * 32767f);
         }
+        _ring.Append(_shortScratch.AsSpan(0, produced * 2));
     }
 
-    public void Read(Span<short> interleavedStereo)
-    {
-        lock (_lock)
-        {
-            int available = Math.Min(_ringCount, interleavedStereo.Length);
-            for (int i = 0; i < available; i++)
-            {
-                interleavedStereo[i] = _ring[_ringRead];
-                _ringRead = (_ringRead + 1) % _ring.Length;
-            }
-            _ringCount -= available;
-            interleavedStereo[available..].Clear();
-        }
-    }
+    public void Read(Span<short> interleavedStereo) => _ring.Read(interleavedStereo);
+
+    /// <summary>
+    /// The capture period the audio engine granted, in milliseconds (B6). Reported rather than
+    /// assumed: whether the low-latency path applies depends on the endpoint and on whether the
+    /// shared engine's period is already locked by another app.
+    /// </summary>
+    public double CapturePeriodMs => _capture.PeriodMilliseconds;
+
+    /// <summary>Why the low-latency capture path was or was not used (B6 diagnostics).</summary>
+    public string CaptureLatencyStatus => _capture.LowLatencyStatus;
+
+    /// <summary>
+    /// Raised once per capture callback, so the real delivery cadence can be measured rather
+    /// than inferred from the requested buffer size (B6's actual acceptance measure).
+    /// </summary>
+    public event Action? SampleBatchObserved;
+
+    /// <inheritdoc />
+    public (long UnderrunFrames, long LateFrames, long GapJumps) CaptureStats =>
+        (_ring.UnderrunFrames, _ring.LateFrames, _ring.GapJumps);
+
+    /// <summary>Aims the reader at the live edge so the first samples streamed are fresh.</summary>
+    public void FlushToLive() => _ring.FlushToLive();
 
     private static void EnsureCapacity(ref float[] buf, int needed)
     {
         if (buf.Length < needed) buf = new float[Math.Max(needed, buf.Length * 2)];
+    }
+
+    private static void EnsureCapacity(ref short[] buf, int needed)
+    {
+        if (buf.Length < needed) buf = new short[Math.Max(needed, buf.Length * 2)];
     }
 
     public void Dispose()

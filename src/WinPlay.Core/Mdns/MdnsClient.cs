@@ -22,9 +22,13 @@ public sealed class MdnsClient : IMdnsTransport
 
     private readonly Socket _socket;
     private readonly List<int> _interfaceIndexes = [];
+    private readonly List<IPAddress> _localAddresses = [];
     private readonly CancellationTokenSource _cts = new();
     private Task? _receiveLoop;
     private bool _disposed;
+
+    /// <inheritdoc />
+    public IReadOnlyList<IPAddress> LocalAddresses => _localAddresses;
 
     public event Action<DnsMessage, IPEndPoint>? MessageReceived;
     public event Action<Exception>? ReceiveError;
@@ -37,13 +41,14 @@ public sealed class MdnsClient : IMdnsTransport
         _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, 255);
         _socket.Bind(new IPEndPoint(IPAddress.Any, MdnsPort));
 
-        foreach (var (_, index) in EnumerateEligibleInterfaces())
+        foreach (var (address, index) in EnumerateEligibleInterfaces())
         {
             try
             {
                 _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership,
                     new MulticastOption(MdnsGroup, index));
                 _interfaceIndexes.Add(index);
+                _localAddresses.Add(address);
             }
             catch (SocketException)
             {
@@ -81,10 +86,51 @@ public sealed class MdnsClient : IMdnsTransport
         }
     }
 
+    /// <summary>
+    /// Sends a serialised DNS message: unicast to <paramref name="unicastTo"/> when answering a
+    /// QU question, otherwise multicast out of every joined interface.
+    /// </summary>
+    public void Send(byte[] packet, IPEndPoint? unicastTo = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (unicastTo is not null)
+        {
+            try { _socket.SendTo(packet, unicastTo); }
+            catch (SocketException) { /* peer vanished */ }
+            return;
+        }
+
+        var dest = new IPEndPoint(MdnsGroup, MdnsPort);
+        foreach (int index in _interfaceIndexes)
+        {
+            try
+            {
+                _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface,
+                    IPAddress.HostToNetworkOrder(index));
+                _socket.SendTo(packet, dest);
+            }
+            catch (SocketException)
+            {
+                // Interface went away mid-session; keep trying the others.
+            }
+        }
+    }
+
+    /// <summary>Longest pause between retries after repeated socket failures.</summary>
+    private static readonly TimeSpan MaxReceiveBackoff = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The single reader for every mDNS packet WinPlay sees — browsing, and the responses its own
+    /// advertiser needs. Nothing that happens inside it may be allowed to end it: if this loop
+    /// stops, device discovery and the DACP endpoint both go dark for the rest of the session, in
+    /// total silence, and every symptom points somewhere else.
+    /// </summary>
     private async Task ReceiveLoopAsync()
     {
         var buffer = new byte[9000];
         EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+        var backoff = TimeSpan.Zero;
+
         while (!_cts.IsCancellationRequested)
         {
             SocketReceiveFromResult result;
@@ -92,25 +138,68 @@ public sealed class MdnsClient : IMdnsTransport
             {
                 result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, remote, _cts.Token)
                     .ConfigureAwait(false);
+                backoff = TimeSpan.Zero;   // a good packet clears the penalty
             }
             catch (OperationCanceledException)
             {
                 return;
             }
+            catch (ObjectDisposedException)
+            {
+                return;   // torn down underneath us; that is an orderly stop
+            }
             catch (SocketException ex)
             {
+                // Retrying flat out was a busy-wait. When the socket enters a state that fails
+                // immediately — the interface it was bound to disappears on a VPN or Wi-Fi switch,
+                // which is exactly when this happens — the loop span an error per iteration and
+                // pinned a core, on a tray app whose whole point is to sit quietly in the
+                // background. Back off instead, and recover instantly once packets flow again.
                 ReceiveError?.Invoke(ex);
+                backoff = backoff == TimeSpan.Zero
+                    ? TimeSpan.FromMilliseconds(50)
+                    : (backoff < MaxReceiveBackoff ? backoff + backoff : MaxReceiveBackoff);
+                try { await Task.Delay(backoff, _cts.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
                 continue;
+            }
+
+            DnsMessage msg;
+            try
+            {
+                msg = DnsMessage.Parse(buffer.AsSpan(0, result.ReceivedBytes));
+            }
+            catch (FormatException)
+            {
+                continue;   // malformed or non-DNS datagram on 5353
             }
 
             try
             {
-                var msg = DnsMessage.Parse(buffer.AsSpan(0, result.ReceivedBytes));
-                MessageReceived?.Invoke(msg, (IPEndPoint)result.RemoteEndPoint);
+                // Each subscriber is invoked SEPARATELY. A multicast delegate stops at the first
+                // target that throws, so wrapping the whole invocation kept the loop alive but
+                // still silently skipped every subscriber registered after the throwing one — the
+                // browser and the DACP advertiser both listen here, so one of them failing could
+                // stop the other from ever seeing that message. Which one survived depended only
+                // on registration order, which nothing enforces.
+                if (MessageReceived is { } handlers)
+                {
+                    var from = (IPEndPoint)result.RemoteEndPoint;
+                    foreach (var handler in handlers.GetInvocationList())
+                    {
+                        try { ((Action<DnsMessage, IPEndPoint>)handler)(msg, from); }
+                        catch (Exception ex) { ReceiveError?.Invoke(ex); }
+                    }
+                }
             }
-            catch (FormatException)
+            catch (Exception ex)
             {
-                // Malformed or non-DNS datagram on 5353 — ignore.
+                // Delivery is kept separate from parsing on purpose. Subscribers do real work —
+                // correlating records, expiring caches, answering queries — and a single
+                // unexpected throw from any one of them used to escape and kill this loop, taking
+                // all mDNS reception with it. A subscriber's bug is the subscriber's problem; the
+                // transport keeps running.
+                ReceiveError?.Invoke(ex);
             }
         }
     }

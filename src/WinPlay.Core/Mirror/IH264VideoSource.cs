@@ -17,6 +17,14 @@ public interface IH264VideoSource : IAsyncDisposable
     event Action<ReadOnlyMemory<byte>, bool>? FrameEncoded;
 
     /// <summary>
+    /// Capture has stopped for good and no further frames will arrive. The session must surface
+    /// this rather than wait: a source that silently produces nothing is indistinguishable, from
+    /// the outside, from a mirror that is simply still starting — which is how "click Mirror, and
+    /// nothing whatsoever happens" became a supported outcome.
+    /// </summary>
+    event Action<Exception>? Failed;
+
+    /// <summary>
     /// Negotiated receiver constraints, applied before <see cref="StartAsync"/>: the
     /// receiver's display size in pixels (0 = not advertised → use the desktop size).
     /// The source fits the desktop into this to pick the encode resolution.

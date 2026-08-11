@@ -74,6 +74,37 @@ public sealed class MirrorSession : IAsyncDisposable
 
     public event Action<string>? StageChanged;
 
+    /// <summary>
+    /// The session stopped working on its own — the receiver went away, the network dropped, or a
+    /// send failed. Every one of the pumps below runs on its own task or thread, so a failure in
+    /// one had nowhere to go: the task faulted, nobody awaited it, and the exception was discarded
+    /// by the runtime. Mirroring simply stopped while the app went on reporting it as live, and
+    /// the toggle stayed on with nothing behind it. This is how that failure reaches the UI.
+    /// </summary>
+    public event Action<Exception>? Faulted;
+
+    private int _faultRaised;
+
+    /// <summary>
+    /// Reports a fault exactly once. A cancelled session is an orderly stop, not a failure, and
+    /// one dead socket typically trips several pumps at the same moment — the user should not be
+    /// told about it three times.
+    /// </summary>
+    private void RaiseFaulted(Exception ex)
+    {
+        if (_cts.IsCancellationRequested) return;
+        if (Interlocked.Exchange(ref _faultRaised, 1) != 0) return;
+        Faulted?.Invoke(ex);
+    }
+
+    /// <summary>Runs a background pump so that its failure is reported instead of swallowed.</summary>
+    private async Task SuperviseAsync(Func<CancellationToken, Task> pump, CancellationToken ct)
+    {
+        try { await pump(ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { RaiseFaulted(ex); }
+    }
+
     public long FramesSent => Interlocked.Read(ref _framesSent);
     public string RtspSessionUri => $"rtsp://{_rtsp.RemoteAddress}/{_sessionId}";
 
@@ -190,7 +221,8 @@ public sealed class MirrorSession : IAsyncDisposable
                 ["streamConnectionID"] = _videoStreamConnectionId,
                 ["shk"] = shk,
                 ["shiv"] = shiv,
-                ["latencyMs"] = 100L,
+                // Same budget the audio stream is pinned to — see MirrorLatency.
+                ["latencyMs"] = MirrorLatency.Milliseconds,
                 ["timestampInfo"] = new List<object?>
                 {
                     new Dictionary<string, object?> { ["name"] = "SubSu" },
@@ -218,8 +250,11 @@ public sealed class MirrorSession : IAsyncDisposable
                 ["controlPort"] = (long)audioControlPort,
                 ["audioMode"] = "default",
                 ["usingScreen"] = true,
-                ["latencyMin"] = 11025L,
-                ["latencyMax"] = 88200L,
+                // PINNED: min == max == the shared budget. A range here would let the receiver's
+                // jitter buffer ratchet up under Wi-Fi contention (which the bulk video stream
+                // causes) and never come back — the cause of audio drifting seconds behind video.
+                ["latencyMin"] = MirrorLatency.Frames(SampleRate),
+                ["latencyMax"] = MirrorLatency.Frames(SampleRate),
                 ["shk"] = _audioChachaKey,
                 ["isMedia"] = true,
                 ["supportsDynamicStreamID"] = true,
@@ -306,9 +341,12 @@ public sealed class MirrorSession : IAsyncDisposable
         _source = source;
         source.Configure(_receiverDisplayW, _receiverDisplayH);
         source.FrameEncoded += OnFrameEncoded;
-        _loops.Add(Task.Run(() => SendLoopAsync(_cts.Token)));
-        _loops.Add(Task.Run(() => DataHeartbeatLoopAsync(_cts.Token)));
-        _loops.Add(Task.Run(() => FeedbackLoopAsync(_cts.Token)));
+        // A source that has stopped producing frames ends the session. Without this the pumps
+        // kept running happily over an empty stream and the app went on reporting a live mirror.
+        source.Failed += RaiseFaulted;
+        _loops.Add(Task.Run(() => SuperviseAsync(SendLoopAsync, _cts.Token)));
+        _loops.Add(Task.Run(() => SuperviseAsync(DataHeartbeatLoopAsync, _cts.Token)));
+        _loops.Add(Task.Run(() => SuperviseAsync(FeedbackLoopAsync, _cts.Token)));
 
         // Audio-in-mirror: an ALAC RTP pump + 1 Hz sync, sharing the video clock so the
         // Apple TV keeps audio and picture in lock-step.
@@ -316,7 +354,7 @@ public sealed class MirrorSession : IAsyncDisposable
         {
             _audioSource = audioSource;
             _audioRtpBase = (uint)RandomNumberGenerator.GetInt32(0, int.MaxValue);
-            _loops.Add(Task.Run(() => AudioSyncLoopAsync(_cts.Token)));
+            _loops.Add(Task.Run(() => SuperviseAsync(AudioSyncLoopAsync, _cts.Token)));
             _audioPumpThread = new Thread(AudioPump) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "WinPlay-MirrorAudio" };
             _audioPumpThread.Start();
         }
@@ -374,7 +412,13 @@ public sealed class MirrorSession : IAsyncDisposable
                 Interlocked.Exchange(ref _audioRtpNow, rtpTime);
             }
         }
-        catch (Exception) { }
+        catch (Exception ex)
+        {
+            // Swallowing this meant the mirror's audio could stop dead while the picture kept
+            // going and the app reported everything as fine. The pump owns its own thread, so the
+            // only place this can be reported from is here.
+            RaiseFaulted(ex);
+        }
         finally { timeEndPeriod(1); }
     }
 
@@ -391,7 +435,10 @@ public sealed class MirrorSession : IAsyncDisposable
             pkt[0] = first ? (byte)0x90 : (byte)0x80;
             pkt[1] = 0xD4;
             BinaryPrimitives.WriteUInt16BigEndian(pkt.AsSpan(2), 0x0007);
-            BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(4), rtpNow - 11025);
+            // The playout point is exactly the shared budget behind the newest sample sent —
+            // the same value SETUP pinned latencyMin/Max to, so the receiver is told one
+            // consistent story and has no elastic room to drift into.
+            BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(4), rtpNow - (uint)MirrorLatency.Frames(SampleRate));
             BinaryPrimitives.WriteUInt64BigEndian(pkt.AsSpan(8), _clock.BootTimestamp);
             BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(16), rtpNow);
             try { await _audioControlSocket!.SendToAsync(pkt, SocketFlags.None, _audioControlRemote!, ct).ConfigureAwait(false); }
@@ -715,17 +762,58 @@ public sealed class MirrorSession : IAsyncDisposable
 }
 
 /// <summary>
+/// The ONE presentation-latency budget a mirroring session promises its receiver, shared by
+/// the video and audio streams (Task C6 / A-V sync).
+///
+/// <para><b>Why this must be a single value.</b> A mirror carries two streams that have to
+/// land on the same instant. Previously each invented its own number: video biased its frame
+/// timestamps by 100 ms while audio anchored its sync packets 250 ms back — a permanent 150 ms
+/// skew before anything else went wrong. Worse, the audio SETUP advertised
+/// <c>latencyMin</c>=250 ms with <c>latencyMax</c>=2000 ms, granting the receiver an 8×
+/// elastic jitter buffer while telling it to target the floor. Real AirPlay receivers ratchet
+/// that buffer UP under jitter — which the bursty video TCP stream on the same Wi-Fi reliably
+/// causes — and never ratchet it back down. The result was audio drifting to seconds behind
+/// video and staying there, while video (whose send queue is drop-oldest, so it cannot
+/// accumulate) stayed flat.</para>
+///
+/// <para>Fixing this by subtracting an offset would be treating the symptom. The cause is the
+/// receiver having permission to buffer more than we promise, so the fix removes the
+/// permission: <c>latencyMin == latencyMax == </c> this value, and every timestamp either
+/// stream emits is derived from it. With no elastic range there is nothing to creep into.
+/// (Same invariant as doubletake's <c>latMin = latMax = audioLatencySamples</c> with the video
+/// timestamp bias taken from the same session latency.)</para>
+///
+/// <para>250 ms is chosen to sit above Wi-Fi jitter for a link shared with bulk video, while
+/// remaining in the range Apple's own mirroring presents at — low enough that lip-sync reads
+/// as immediate.</para>
+/// </summary>
+internal static class MirrorLatency
+{
+    /// <summary>The shared presentation delay for both mirror streams.</summary>
+    public static readonly TimeSpan Target = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>The same budget in audio frames at 44.1 kHz (11025 = 250 ms).</summary>
+    public static long Frames(int sampleRate) => (long)(Target.TotalSeconds * sampleRate);
+
+    /// <summary>The same budget in whole milliseconds, for the video stream's SETUP.</summary>
+    public static long Milliseconds => (long)Target.TotalMilliseconds;
+}
+
+/// <summary>
 /// Boot-relative NTP clock for mirroring. Frame headers use raw boot-relative fixed-point
-/// (plus a small forward bias = playout latency); timing replies add the 1900→1970 epoch,
-/// matching what Apple senders emit (doubletake mirror.go).
+/// (plus a forward bias = the session's playout latency); timing replies add the 1900→1970
+/// epoch, matching what Apple senders emit (doubletake mirror.go).
+///
+/// <para>The bias is <see cref="MirrorLatency.Target"/> — the SAME budget the audio stream is
+/// pinned to. Video and audio must promise the receiver one shared presentation delay or they
+/// cannot be in sync by construction.</para>
 /// </summary>
 internal sealed class MirrorClock
 {
     private const ulong EpochOffsetSeconds = 2208988800UL;
-    private static readonly TimeSpan Bias = TimeSpan.FromMilliseconds(100);
     private readonly Stopwatch _sw = Stopwatch.StartNew();
 
-    public ulong FrameTimestamp => ToNtp(_sw.Elapsed + Bias, 0);
+    public ulong FrameTimestamp => ToNtp(_sw.Elapsed + MirrorLatency.Target, 0);
     public ulong BootTimestamp => ToNtp(_sw.Elapsed, EpochOffsetSeconds);
 
     private static ulong ToNtp(TimeSpan elapsed, ulong epochOffset)

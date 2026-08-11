@@ -117,10 +117,14 @@ public sealed class PtpMaster : IDisposable
                 $"cannot bind PTP ports {EventPort}/{GeneralPort} (another PTP service running?): {ex.SocketErrorCode}", ex);
         }
 
-        _ = Task.Run(() => ReceiveLoopAsync(_eventSocket, _cts.Token));
-        _ = Task.Run(() => ReceiveLoopAsync(_generalSocket, _cts.Token));
-        _ = Task.Run(() => AnnounceLoopAsync(_cts.Token));
-        _ = Task.Run(() => SyncLoopAsync(_cts.Token));
+        // Every one of these is supervised. This clock is the timing backbone for buffered audio
+        // and for keeping a stereo pair or a multi-room group in step; if one of these loops dies
+        // there is no sound of it failing, only audio that gradually drifts apart or stops, and
+        // nothing anywhere to say why.
+        _ = Task.Run(() => SuperviseAsync("ptp event receive", ct => ReceiveLoopAsync(_eventSocket, ct), _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp general receive", ct => ReceiveLoopAsync(_generalSocket, ct), _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp announce", AnnounceLoopAsync, _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp sync", SyncLoopAsync, _cts.Token));
     }
 
     /// <summary>Reference-counted: concurrent sessions may share a peer address.</summary>
@@ -203,20 +207,50 @@ public sealed class PtpMaster : IDisposable
 
     // ------------------------------------------------------------ receive
 
+    /// <summary>
+    /// Runs a clock loop so that its failure is reported instead of vanishing. A bare
+    /// <c>Task.Run</c> whose task nobody awaits discards the exception that ended it, which for
+    /// this class means the grandmaster silently stops serving time.
+    /// </summary>
+    private async Task SuperviseAsync(string what, Func<CancellationToken, Task> loop, CancellationToken ct)
+    {
+        try { await loop(ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }   // torn down underneath us
+        catch (Exception ex) { Diagnostic?.Invoke($"{what} stopped: {ex.Message}"); }
+    }
+
+    /// <summary>Longest pause between retries after repeated socket failures.</summary>
+    private static readonly TimeSpan MaxReceiveBackoff = TimeSpan.FromSeconds(2);
+
     private async Task ReceiveLoopAsync(Socket socket, CancellationToken ct)
     {
         byte[] buf = new byte[512];
         EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+        var backoff = TimeSpan.Zero;
         while (!ct.IsCancellationRequested)
         {
             SocketReceiveFromResult r;
             try
             {
                 r = await socket.ReceiveFromAsync(buf, SocketFlags.None, any, ct).ConfigureAwait(false);
+                backoff = TimeSpan.Zero;
             }
             catch (OperationCanceledException) { return; }
-            catch (SocketException) { continue; }
             catch (ObjectDisposedException) { return; }
+            catch (SocketException)
+            {
+                // Retrying immediately was a busy-wait whenever the socket entered a persistently
+                // failing state — the bound interface going away on a network change, which is
+                // precisely when it happens. A spinning core is not something a background tray
+                // app can afford, least of all while it is also pumping audio.
+                backoff = backoff == TimeSpan.Zero
+                    ? TimeSpan.FromMilliseconds(20)
+                    : (backoff < MaxReceiveBackoff ? backoff + backoff : MaxReceiveBackoff);
+                try { await Task.Delay(backoff, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                continue;
+            }
             if (r.ReceivedBytes < 34) continue;
 
             var from = ((IPEndPoint)r.RemoteEndPoint).Address;
@@ -226,25 +260,36 @@ public sealed class PtpMaster : IDisposable
                     state.LastSeen = DateTime.UtcNow;
             }
 
-            switch (buf[0] & 0x0F)
+            // Answering one peer must never end the loop. These sends go straight back to a
+            // device on the LAN, so they throw for entirely ordinary reasons — a speaker
+            // switched off mid-exchange, a Wi-Fi roam, a route that vanished. Unguarded, the
+            // first such throw killed this receive loop for good, and with it every future
+            // Delay_Req from EVERY receiver: the remaining speakers could no longer measure
+            // their offset to our clock, so they drifted apart with nothing reported.
+            try
             {
-                case 0x01: // Delay_Req → Delay_Resp on the general port
-                    if (r.ReceivedBytes < 44) break;
-                    _generalSocket.SendTo(BuildDelayResp(ClockId, buf.AsSpan(0, r.ReceivedBytes), MonotonicClock.Now),
-                        new IPEndPoint(from, GeneralPort));
-                    if (Interlocked.Increment(ref _delayReqsAnswered) == 1)
-                        Diagnostic?.Invoke($"ptp: first Delay_Req from {from} — receiver is slaving to our clock");
-                    break;
-                case 0x02: // PDelay_Req → PDelay_Resp (event) + PDelay_Resp_Follow_Up (general)
-                    if (r.ReceivedBytes < 44) break;
-                    _eventSocket.SendTo(BuildPDelayResp(ClockId, 0x03, buf.AsSpan(0, r.ReceivedBytes)),
-                        new IPEndPoint(from, EventPort));
-                    _generalSocket.SendTo(BuildPDelayResp(ClockId, 0x0A, buf.AsSpan(0, r.ReceivedBytes)),
-                        new IPEndPoint(from, GeneralPort));
-                    break;
-                // Announce/Sync/Follow_Up/Signaling from others: ignored. We claim
-                // clockClass 6 (GPS) so every AirPlay device yields BMCA to us.
+                switch (buf[0] & 0x0F)
+                {
+                    case 0x01: // Delay_Req → Delay_Resp on the general port
+                        if (r.ReceivedBytes < 44) break;
+                        _generalSocket.SendTo(BuildDelayResp(ClockId, buf.AsSpan(0, r.ReceivedBytes), MonotonicClock.Now),
+                            new IPEndPoint(from, GeneralPort));
+                        if (Interlocked.Increment(ref _delayReqsAnswered) == 1)
+                            Diagnostic?.Invoke($"ptp: first Delay_Req from {from} — receiver is slaving to our clock");
+                        break;
+                    case 0x02: // PDelay_Req → PDelay_Resp (event) + PDelay_Resp_Follow_Up (general)
+                        if (r.ReceivedBytes < 44) break;
+                        _eventSocket.SendTo(BuildPDelayResp(ClockId, 0x03, buf.AsSpan(0, r.ReceivedBytes)),
+                            new IPEndPoint(from, EventPort));
+                        _generalSocket.SendTo(BuildPDelayResp(ClockId, 0x0A, buf.AsSpan(0, r.ReceivedBytes)),
+                            new IPEndPoint(from, GeneralPort));
+                        break;
+                    // Announce/Sync/Follow_Up/Signaling from others: ignored. We claim
+                    // clockClass 6 (GPS) so every AirPlay device yields BMCA to us.
+                }
             }
+            catch (SocketException) { }        // that peer is unreachable this instant; others are not
+            catch (ObjectDisposedException) { return; }
         }
     }
 
