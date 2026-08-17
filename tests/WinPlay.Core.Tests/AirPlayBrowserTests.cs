@@ -14,8 +14,12 @@ public class AirPlayBrowserTests
         public event Action<DnsMessage, IPEndPoint>? MessageReceived;
         public List<IReadOnlyList<(string Name, DnsType Type, bool UnicastResponse)>> Queries { get; } = [];
 
+        public List<byte[]> Sent { get; } = [];
+        public IReadOnlyList<IPAddress> LocalAddresses => [IPAddress.Loopback];
+
         public void Start() { }
         public void Query(IReadOnlyList<(string Name, DnsType Type, bool UnicastResponse)> questions) => Queries.Add(questions);
+        public void Send(byte[] packet, IPEndPoint? unicastTo = null) => Sent.Add(packet);
         public void Raise(DnsMessage msg) => MessageReceived?.Invoke(msg, new IPEndPoint(IPAddress.Loopback, 5353));
         public void Dispose() { }
     }

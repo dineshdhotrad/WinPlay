@@ -55,14 +55,30 @@ public sealed class RtspConnection : IDisposable
     private int _cseq;
     private int _plainReadPos;
 
-    // Stable per-connection sender identity headers.
-    private readonly string _dacpId = Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
-    private readonly string _activeRemote = RandomNumberGenerator.GetInt32(1, int.MaxValue).ToString();
+    // Sender identity headers. DACP-ID is process-wide (see DacpIdentity) so it matches the one
+    // iTunes_Ctrl_<id> control endpoint WinPlay advertises — a receiver resolves it to find where
+    // to send commands back, and there is one PC media session for them all to address.
+    //
+    // Active-Remote is per-destination when the caller supplies one. The receiver echoes it on
+    // every command, so it is what lets the app tell WHICH speaker is asking. That matters for
+    // volume: turning the dial on a HomePod means "make this speaker quieter", and with a single
+    // shared token the app could not distinguish it from any other room and changed them all.
+    // Client-Instance stays per-connection.
+    private readonly string _dacpId = Raop.DacpIdentity.DacpId;
+    private readonly string _activeRemote;
     private readonly string _clientInstance = Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
+
+    /// <param name="activeRemote">
+    /// Token this connection presents, identifying its destination to the DACP server. Defaults to
+    /// the process-wide identity, which keeps transport control working for callers that do not
+    /// need per-destination attribution.
+    /// </param>
+    public RtspConnection(string? activeRemote = null) =>
+        _activeRemote = activeRemote ?? Raop.DacpIdentity.ActiveRemote;
 
     public string ClientName { get; init; } = "WinPlay";
 
-    // .NET may report IPv4-mapped IPv6 endpoints (::ffff:a.b.c.d) from dual-mode
+    //.NET may report IPv4-mapped IPv6 endpoints (::ffff:a.b.c.d) from dual-mode
     // sockets; normalize to IPv4 so UDP sockets and URI strings stay AF_INET.
     public IPAddress LocalAddress => Normalize(((IPEndPoint)(_tcp.Client.LocalEndPoint
         ?? throw new InvalidOperationException("not connected"))).Address);
@@ -82,15 +98,36 @@ public sealed class RtspConnection : IDisposable
     /// <summary>Switches the connection to encrypted framing (call right after pair-setup).</summary>
     public void EnableEncryption(ChannelCrypto crypto) => _crypto = crypto;
 
+    /// <summary>
+    /// How long a single request may wait for its response. Every request is serialised behind
+    /// one lock, so an unbounded wait does not just hang its own caller — it also blocks the 2 s
+    /// /feedback keep-alive on the same connection. The receiver then drops the session on its
+    /// own ~30 s timer while the sender never notices, so playback ends with no error and no
+    /// Faulted event. A receiver that is alive answers in well under this.
+    /// </summary>
+    public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
+
     public async Task<RtspResponse> RequestAsync(RtspRequest request, CancellationToken ct)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            byte[] wire = BuildWire(request);
-            byte[] payload = _crypto is null ? wire : _crypto.Encrypt(wire);
-            await _stream!.WriteAsync(payload, ct).ConfigureAwait(false);
-            return await ReadResponseAsync(ct).ConfigureAwait(false);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(RequestTimeout);
+            try
+            {
+                byte[] wire = BuildWire(request);
+                byte[] payload = _crypto is null ? wire : _crypto.Encrypt(wire);
+                await _stream!.WriteAsync(payload, deadline.Token).ConfigureAwait(false);
+                return await ReadResponseAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // Distinguish "the receiver stopped answering" from "the caller cancelled":
+                // only the former should fault the session and trigger a reconnect.
+                throw new RtspException(
+                    $"{request.Method} timed out after {RequestTimeout.TotalSeconds:F0}s — receiver stopped responding");
+            }
         }
         finally
         {

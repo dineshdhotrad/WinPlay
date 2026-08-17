@@ -14,6 +14,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\WinPlay.Core\WinPlay.Core.csproj" />
     <ProjectReference Include="..\..\src\WinPlay.Capture\WinPlay.Capture.csproj" />
+    <ProjectReference Include="..\..\src\WinPlay.Diagnostics\WinPlay.Diagnostics.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -48,16 +48,22 @@ public sealed class TrayIcon : IDisposable
     private readonly WndProcDelegate _wndProc; // rooted — GC must not collect the thunk
     private readonly IntPtr _hwnd;
     private readonly IntPtr _icon;
+    private readonly string _tooltip;
+    private readonly uint _taskbarCreatedMsg; // broadcast when Explorer (re)starts
     private bool _added;
 
     /// <summary>Left-click (open the flyout).</summary>
     public event Action? LeftClicked;
+
+    /// <summary>The registered global hotkey was pressed — opens the picker from anywhere.</summary>
+    public event Action? HotkeyPressed;
 
     /// <summary>Builds the right-click menu fresh each time (so checkbox state is current).</summary>
     public Func<IReadOnlyList<TrayMenuItem>>? MenuBuilder { get; set; }
 
     public TrayIcon(string tooltip, string iconPath)
     {
+        _tooltip = tooltip;
         _wndProc = WndProc;
         var wc = new WndClassEx
         {
@@ -67,6 +73,10 @@ public sealed class TrayIcon : IDisposable
             lpszClassName = "WinPlayTrayWindow",
         };
         RegisterClassEx(ref wc);
+
+        // Explorer broadcasts "TaskbarCreated" when it starts or restarts (e.g. after an
+        // explorer.exe crash). We re-add our icon on that message so it never vanishes.
+        _taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated");
         _hwnd = CreateWindowEx(0, wc.lpszClassName, "WinPlayTray", 0, 0, 0, 0, 0,
             IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
         if (_hwnd == IntPtr.Zero)
@@ -77,14 +87,20 @@ public sealed class TrayIcon : IDisposable
         if (_icon == IntPtr.Zero)
             throw new InvalidOperationException($"failed to load tray icon '{iconPath}'");
 
+        if (!AddIcon())
+            throw new InvalidOperationException("Shell_NotifyIcon add failed");
+        _added = true;
+    }
+
+    /// <summary>Registers (or re-registers) the notification-area icon.</summary>
+    private bool AddIcon()
+    {
         var data = MakeData();
         data.uFlags = NifMessage | NifIcon | NifTip;
         data.uCallbackMessage = WmTrayCallback;
         data.hIcon = _icon;
-        data.szTip = tooltip;
-        if (!Shell_NotifyIcon(NimAdd, ref data))
-            throw new InvalidOperationException("Shell_NotifyIcon add failed");
-        _added = true;
+        data.szTip = _tooltip;
+        return Shell_NotifyIcon(NimAdd, ref data);
     }
 
     public void SetTooltip(string tooltip)
@@ -93,6 +109,21 @@ public sealed class TrayIcon : IDisposable
         data.uFlags = NifTip;
         data.szTip = tooltip;
         Shell_NotifyIcon(NimModify, ref data);
+    }
+
+    private const int WmHotkey = 0x0312;
+    private const int HotkeyId = 1;
+    private bool _hotkeyRegistered;
+
+    /// <summary>
+    /// Registers a system-wide hotkey on the tray's message window. Returns false when the
+    /// gesture is already owned by another application — callers surface that rather than fail.
+    /// </summary>
+    public bool TryRegisterHotkey(uint modifiers, uint virtualKey)
+    {
+        if (_hotkeyRegistered) UnregisterHotKey(_hwnd, HotkeyId);
+        _hotkeyRegistered = RegisterHotKey(_hwnd, HotkeyId, modifiers, virtualKey);
+        return _hotkeyRegistered;
     }
 
     private NotifyIconData MakeData() => new()
@@ -112,6 +143,17 @@ public sealed class TrayIcon : IDisposable
                 case WmRButtonUp:
                 case WmContextMenu: ShowMenu(); break;
             }
+            return IntPtr.Zero;
+        }
+        if (msg == WmHotkey && (int)wParam == HotkeyId)
+        {
+            HotkeyPressed?.Invoke();
+            return IntPtr.Zero;
+        }
+        if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
+        {
+            // Explorer (re)started — re-register the icon so it reappears in the tray.
+            _added = AddIcon();
             return IntPtr.Zero;
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -163,6 +205,11 @@ public sealed class TrayIcon : IDisposable
 
     public void Dispose()
     {
+        if (_hotkeyRegistered)
+        {
+            UnregisterHotKey(_hwnd, HotkeyId);
+            _hotkeyRegistered = false;
+        }
         if (_added)
         {
             var data = MakeData();
@@ -241,6 +288,15 @@ public sealed class TrayIcon : IDisposable
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern bool Shell_NotifyIcon(int message, ref NotifyIconData data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string msg);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnregisterHotKey(IntPtr hwnd, int id);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }

@@ -30,13 +30,18 @@ public static class DnsQueryWriter
         return [.. buf];
     }
 
+    /// <summary>
+    /// Encodes a presentation-format name. Splitting honours RFC 1035 §5.1 escapes, so a label
+    /// containing a literal dot — ordinary in a DNS-SD instance name — is written back as the one
+    /// label it actually is. <see cref="DnsName.SplitLabels"/> enforces the wire limits and reports
+    /// a violation as <see cref="FormatException"/>, which is what callers handling names taken off
+    /// the network already expect.
+    /// </summary>
     private static void WriteName(List<byte> buf, string name)
     {
-        foreach (string label in name.TrimEnd('.').Split('.'))
+        foreach (string label in DnsName.SplitLabels(name))
         {
             byte[] bytes = Encoding.UTF8.GetBytes(label);
-            if (bytes.Length is 0 or > 63)
-                throw new ArgumentException($"invalid DNS label '{label}'", nameof(name));
             buf.Add((byte)bytes.Length);
             buf.AddRange(bytes);
         }

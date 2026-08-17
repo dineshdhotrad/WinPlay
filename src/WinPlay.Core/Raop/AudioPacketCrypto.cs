@@ -8,7 +8,7 @@ namespace WinPlay.Core.Raop;
 /// Per-packet RTP audio encryption for AirPlay 2 realtime streams:
 /// ChaCha20-Poly1305 with the 32-byte audio key (first 32 bytes of the SRP shared
 /// secret for transient pairing). Packet layout:
-///   [12-byte RTP header][ciphertext][16-byte tag][8-byte nonce suffix]
+/// [12-byte RTP header][ciphertext][16-byte tag][8-byte nonce suffix]
 /// AAD = RTP header bytes 4..12 (timestamp + SSRC). The nonce is derived from the RTP
 /// sequence number — [0,0,0,0, seq_lo, seq_hi, 0,0,0,0,0,0] — matching owntone; Apple
 /// receivers reconstruct it from the sequence number, so an independent counter fails

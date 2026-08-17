@@ -31,7 +31,7 @@ public sealed class HapSession
 public sealed class HapPairingException(string message) : Exception(message);
 
 /// <summary>
-/// HAP transient pair-setup (plan §3.3 flow 1): SRP-6a over POST /pair-setup with the
+/// HAP transient pair-setup: SRP-6a over POST /pair-setup with the
 /// fixed PIN 3939, Flags=0x10, header X-Apple-HKP: 4. No credentials are stored and no
 /// pair-verify step is needed afterward. The transport callback posts a TLV8 body to
 /// /pair-setup and returns the response body.

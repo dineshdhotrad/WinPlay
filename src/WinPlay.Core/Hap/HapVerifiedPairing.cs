@@ -28,14 +28,14 @@ public sealed record HapPairingCredentials
 }
 
 /// <summary>
-/// HAP pairing for PIN-protected receivers (plan §3.3 flow 2, pyatv parity — header
+/// HAP pairing for PIN-protected receivers (pyatv parity — header
 /// X-Apple-HKP: 3):
-///  - Pair-setup: POST /pair-pin-start makes the receiver display a PIN, then SRP-6a
-///    M1–M4 with that PIN as password, then M5/M6 exchange Ed25519 long-term identities
-///    encrypted with ChaCha20-Poly1305 (nonces "PS-Msg05"/"PS-Msg06").
-///  - Pair-verify: on every later connection, X25519 ECDH + Ed25519 signatures (nonces
-///    "PV-Msg02"/"PV-Msg03"); the 32-byte shared secret drives the same channel-key
-///    derivation as transient pairing.
+/// - Pair-setup: POST /pair-pin-start makes the receiver display a PIN, then SRP-6a
+/// M1–M4 with that PIN as password, then M5/M6 exchange Ed25519 long-term identities
+/// encrypted with ChaCha20-Poly1305 (nonces "PS-Msg05"/"PS-Msg06").
+/// - Pair-verify: on every later connection, X25519 ECDH + Ed25519 signatures (nonces
+/// "PV-Msg02"/"PV-Msg03"); the 32-byte shared secret drives the same channel-key
+/// derivation as transient pairing.
 /// </summary>
 public static class HapVerifiedPairing
 {

@@ -1,0 +1,51 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly, so newly published rules find old code even when nothing is pushed.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze C#
+    # Pinned: a moving image changes the analysis surface without any change to this repo.
+    runs-on: windows-2025
+    permissions:
+      security-events: write   # required to upload the SARIF results
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          languages: csharp
+          queries: security-and-quality
+
+      # Built explicitly: autobuild cannot resolve the WinUI app's platform requirement,
+      # and analysing only part of the codebase would give false confidence.
+      - name: Build
+        run: |
+          dotnet build tools/WinPlay.DiscoveryCli/WinPlay.DiscoveryCli.csproj -c Release
+          dotnet build src/WinPlay.App/WinPlay.App.csproj -c Release -p:Platform=x64
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          category: /language:csharp

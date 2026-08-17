@@ -45,8 +45,8 @@ public static class MonotonicClock
 /// master; receivers are added as unicast peers and slave to us (they yield BMCA
 /// because we announce clockClass 6 / GPS). Ported from owntone's libairptp, which
 /// mirrors captured iOS sender traffic:
-///   Announce 1 Hz (general :320), Sync+Follow_Up two-step 8 Hz (event :319 /
-///   general :320), Signaling 1 Hz, Delay_Req answered with Delay_Resp.
+/// Announce 1 Hz (general:320), Sync+Follow_Up two-step 8 Hz (event:319 /
+/// general:320), Signaling 1 Hz, Delay_Req answered with Delay_Resp.
 /// Process-wide singleton — one clock serves every session (that is the point of
 /// multi-room). Windows has no privileged-port concept, so binding 319/320 only
 /// fails if another PTP daemon is running.
@@ -76,7 +76,11 @@ public sealed class PtpMaster : IDisposable
         }
     }
 
-    /// <summary>Random non-EUI-64 clock identity (IEEE 1588-2019 §7.5.2.2.3, owntone style).</summary>
+    /// <summary>
+    /// Grandmaster clock identity: a stable EUI-64 derived from the primary NIC's MAC
+    /// (IEEE 1588-2008 §7.5.2.2.2) — see <see cref="StableClockIdentity"/> for why stability
+    /// across launches is load-bearing, not cosmetic.
+    /// </summary>
     public ulong ClockId { get; }
 
     /// <summary>UUID advertised as timingPeerInfo.ID (iOS sends one; origin unknown).</summary>
@@ -84,8 +88,17 @@ public sealed class PtpMaster : IDisposable
 
     private sealed class PeerState
     {
+        /// <summary>Whether this peer has been reported as slaved, so it is said once each.</summary>
+        public bool SlavedLogged;
+
         public int RefCount;
         public DateTime LastSeen;
+
+        /// <summary>Delay_Reqs answered for THIS peer — the direct measure of its servo activity.</summary>
+        public int DelayReqCount;
+
+        /// <summary>Completed (under the peers lock) as <see cref="DelayReqCount"/> passes each target.</summary>
+        public readonly List<(int Target, TaskCompletionSource<bool> Tcs)> SettleWaiters = [];
     }
 
     private readonly Socket _eventSocket;
@@ -93,19 +106,90 @@ public sealed class PtpMaster : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Dictionary<IPAddress, PeerState> _peers = [];
     private readonly object _peersLock = new();
-    private ushort _announceSeq;
-    private ushort _signalingSeq;
-    private ushort _syncSeq;
+    // int + Interlocked, truncated to ushort at use: Announce/Signaling/Sync are sent from the
+    // periodic loops AND from the initial burst a connect thread fires for a new peer. A torn
+    // ushort++ can hand two different Sync/Follow_Up pairs one sequence number, and a receiver
+    // matching Follow_Up to Sync by sequence then computes its offset from the wrong Sync — a
+    // silent timing error at the exact moment a speaker joins.
+    private int _announceSeq;
+    private int _signalingSeq;
+    private int _syncSeq;
     private long _delayReqsAnswered;
 
     public event Action<string>? Diagnostic;
 
     public long DelayRequestsAnswered => Interlocked.Read(ref _delayReqsAnswered);
 
+    /// <summary>
+    /// Completes once <paramref name="peer"/> has sent at least <paramref name="delayReqTarget"/>
+    /// Delay_Reqs, or the timeout expires (false). Event-driven — completed by the Delay_Req
+    /// handler itself, no polling.
+    ///
+    /// <para>A receiver introduced to a grandmaster it has never seen slaves quickly but TRUSTS
+    /// slowly: it sends Delay_Reqs within milliseconds, yet discards a SETRATEANCHORTIME anchor
+    /// that arrives before its servo has converged on the new timeline — silently, with the
+    /// session otherwise healthy. Verified on a HomePod mini: an anchor ~1.5 s after first contact
+    /// → silence every time; the identical session with the anchor held ~6 s → plays. Grouped
+    /// sessions always worked because serial member handshakes delayed the shared anchor past the
+    /// convergence window by accident. This wait makes that guarantee explicit and event-driven
+    /// instead of an accident of topology.</para>
+    /// </summary>
+    public Task<bool> WaitForPeerSettleAsync(IPAddress peer, int delayReqTarget, TimeSpan timeout,
+        CancellationToken ct)
+    {
+        TaskCompletionSource<bool> tcs;
+        lock (_peersLock)
+        {
+            if (!_peers.TryGetValue(peer, out var state))
+                return Task.FromResult(false);          // unknown peer: nothing to wait for
+            if (state.DelayReqCount >= delayReqTarget)
+                return Task.FromResult(true);           // already settled
+            tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            state.SettleWaiters.Add((delayReqTarget, tcs));
+        }
+        // Timeout/cancel resolve the same task the Delay_Req handler resolves; whichever comes
+        // first wins and the rest are no-ops on the completed TCS.
+        _ = Task.Delay(timeout, ct).ContinueWith(
+            t => tcs.TrySetResult(false), TaskScheduler.Default);
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// The grandmaster's clock identity as a MAC-derived EUI-64 (IEEE 1588-2008 §7.5.2.2.2:
+    /// MAC-48 with <c>FF FE</c> inserted) — the SAME value on every launch.
+    ///
+    /// <para>Every Apple device presents one clock identity for its whole life. This was random
+    /// per process, so each run of WinPlay appeared to the LAN as a brand-new grandmaster: a
+    /// receiver that had slaved to the previous run's clock had to notice that master vanish
+    /// (announce timeout), re-elect, and re-converge — per run. Observed consequence on a HomePod
+    /// mini: the first buffered session after the receiver rebooted (no prior master state)
+    /// rendered fine, while an identical session minutes later — now the receiver's Nth new
+    /// master of the evening — stayed silent, because the anchor's
+    /// <c>networkTimeTimelineID</c> named a timeline the receiver had not (yet) adopted. A stable
+    /// identity makes every WinPlay run the same master RETURNING, which is the situation PTP's
+    /// state machines are designed for.</para>
+    /// </summary>
+    private static ulong StableClockIdentity()
+    {
+        byte[]? mac = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up
+                        && n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
+            .Select(n => n.GetPhysicalAddress().GetAddressBytes())
+            .FirstOrDefault(b => b.Length == 6);
+        // No usable NIC (rare; e.g. everything down): a machine-stable stand-in beats a random
+        // one — stability across runs is the property that matters here.
+        mac ??= SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Environment.MachineName))[..6];
+
+        Span<byte> eui = stackalloc byte[8];
+        eui[0] = mac[0]; eui[1] = mac[1]; eui[2] = mac[2];
+        eui[3] = 0xFF; eui[4] = 0xFE;
+        eui[5] = mac[3]; eui[6] = mac[4]; eui[7] = mac[5];
+        return BinaryPrimitives.ReadUInt64BigEndian(eui);
+    }
+
     private PtpMaster()
     {
-        ClockId = (BinaryPrimitives.ReadUInt64LittleEndian(RandomNumberGenerator.GetBytes(8))
-                   & 0x0000FFFFFFFFFFFFUL) | 0xFFFF000000000000UL;
+        ClockId = StableClockIdentity();
         try
         {
             _eventSocket = BindUdp(EventPort);
@@ -117,15 +201,20 @@ public sealed class PtpMaster : IDisposable
                 $"cannot bind PTP ports {EventPort}/{GeneralPort} (another PTP service running?): {ex.SocketErrorCode}", ex);
         }
 
-        _ = Task.Run(() => ReceiveLoopAsync(_eventSocket, _cts.Token));
-        _ = Task.Run(() => ReceiveLoopAsync(_generalSocket, _cts.Token));
-        _ = Task.Run(() => AnnounceLoopAsync(_cts.Token));
-        _ = Task.Run(() => SyncLoopAsync(_cts.Token));
+        // Every one of these is supervised. This clock is the timing backbone for buffered audio
+        // and for keeping a stereo pair or a multi-room group in step; if one of these loops dies
+        // there is no sound of it failing, only audio that gradually drifts apart or stops, and
+        // nothing anywhere to say why.
+        _ = Task.Run(() => SuperviseAsync("ptp event receive", ct => ReceiveLoopAsync(_eventSocket, ct), _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp general receive", ct => ReceiveLoopAsync(_generalSocket, ct), _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp announce", AnnounceLoopAsync, _cts.Token));
+        _ = Task.Run(() => SuperviseAsync("ptp sync", SyncLoopAsync, _cts.Token));
     }
 
     /// <summary>Reference-counted: concurrent sessions may share a peer address.</summary>
     public void AddPeer(IPAddress address)
     {
+        bool isNew = false;
         lock (_peersLock)
         {
             if (_peers.TryGetValue(address, out var state))
@@ -135,10 +224,45 @@ public sealed class PtpMaster : IDisposable
             }
             else
             {
-                _peers[address] = new PeerState { RefCount = 1, LastSeen = DateTime.UtcNow };
+                var fresh = new PeerState { RefCount = 1, LastSeen = DateTime.UtcNow };
+                // A returning peer resumes from its remembered convergence: the receiver's servo
+                // never forgot our (stable) clock, so its settle gate should not pretend it did.
+                // The memory is bounded — see WarmPeerMemory — so a receiver that rebooted in the
+                // meantime (losing real servo state) eventually re-earns trust from zero.
+                if (_warmPeers.TryGetValue(address, out var warm)
+                    && Environment.TickCount64 - warm.LastSeenMs < (long)WarmPeerMemory.TotalMilliseconds)
+                {
+                    fresh.DelayReqCount = warm.DelayReqCount;
+                }
+                _warmPeers.Remove(address);
+                _peers[address] = fresh;
+                isNew = true;
             }
         }
         Diagnostic?.Invoke($"ptp: peer {address} added (clock 0x{ClockId:X16})");
+
+        // Announce to a brand-new peer IMMEDIATELY, rather than leaving it to wait for the next
+        // scheduled tick.
+        //
+        // A PTP client discards Sync and Follow_Up that arrive before it has an Announce from that
+        // clock — it has not run BMCA and elected us master yet, so the traffic means nothing to
+        // it. Announce is only sent once a second, so a peer added just after a tick waited up to
+        // a full second while everything we sent it was thrown away.
+        //
+        // The buffered-audio anchor fires about 350 ms after the peer is added, so on a fast LAN
+        // that race was routinely lost — and losing it is silent: every RTSP step still returns
+        // 200 OK, the audio channel still connects and still receives frames, but with no elected
+        // master the receiver has no clock to render them against and simply plays nothing.
+        //
+        // A GROUP hid this by accident. Members connect sequentially, and each extra member's
+        // handshake padded the wall clock past the one-second gap. A single speaker has no such
+        // padding, which is exactly why one lone HomePod stayed silent while a stereo pair and a
+        // multi-room group played perfectly.
+        //
+        // The reference implementation this module is ported from does the same thing on peer-add
+        // (owntone libairptp `daemon_peer_add`, which fires the announce and signaling timers
+        // immediately); the port simply dropped it.
+        if (isNew) SendInitialBurstTo(address);
     }
 
     public void RemovePeer(IPAddress address)
@@ -147,10 +271,30 @@ public sealed class PtpMaster : IDisposable
         {
             if (!_peers.TryGetValue(address, out var state)) return;
             if (--state.RefCount > 0) return;
+            // The peer leaves OUR bookkeeping, but its servo does not forget our clock: the
+            // receiver keeps its converged timeline state, and our grandmaster identity is stable
+            // across sessions. Remember how far it got, so the next session does not re-charge a
+            // trust the receiver still holds.
+            if (state.DelayReqCount > 0)
+                _warmPeers[address] = (state.DelayReqCount, Environment.TickCount64);
             _peers.Remove(address);
         }
         Diagnostic?.Invoke($"ptp: peer {address} removed");
     }
+
+    /// <summary>
+    /// Delay_Req progress of peers whose sessions have ended, kept for
+    /// <see cref="WarmPeerMemory"/> so a returning receiver's settle gate resumes from its
+    /// actual convergence state instead of restarting from zero.
+    /// </summary>
+    private readonly Dictionary<IPAddress, (int DelayReqCount, long LastSeenMs)> _warmPeers = [];
+
+    /// <summary>
+    /// How long a departed peer's convergence is trusted to persist. A receiver's servo holds a
+    /// known grandmaster's timeline for far longer than this; the bound exists so a receiver that
+    /// silently rebooted (losing all servo state) cannot be treated as warm indefinitely.
+    /// </summary>
+    private static readonly TimeSpan WarmPeerMemory = TimeSpan.FromMinutes(10);
 
     // ------------------------------------------------------------ send loops
 
@@ -158,8 +302,8 @@ public sealed class PtpMaster : IDisposable
     {
         while (!ct.IsCancellationRequested)
         {
-            SendToPeers(_generalSocket, GeneralPort, BuildAnnounce(ClockId, _announceSeq++));
-            SendToPeers(_generalSocket, GeneralPort, BuildSignaling(ClockId, _signalingSeq++));
+            SendToPeers(_generalSocket, GeneralPort, BuildAnnounce(ClockId, unchecked((ushort)Interlocked.Increment(ref _announceSeq))));
+            SendToPeers(_generalSocket, GeneralPort, BuildSignaling(ClockId, unchecked((ushort)Interlocked.Increment(ref _signalingSeq))));
             try { await Task.Delay(1000, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
@@ -171,13 +315,38 @@ public sealed class PtpMaster : IDisposable
         {
             // Two-step: Sync carries a zero timestamp, the Follow_Up carries the
             // precise time the Sync left (owntone samples it between the sends).
-            ushort seq = _syncSeq++;
+            ushort seq = unchecked((ushort)Interlocked.Increment(ref _syncSeq));
             SendToPeers(_eventSocket, EventPort, BuildSync(ClockId, seq));
             var ts = MonotonicClock.Now;
             SendToPeers(_generalSocket, GeneralPort, BuildFollowUp(ClockId, seq, ts));
             try { await Task.Delay(125, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
+    }
+
+    /// <summary>
+    /// Sends one peer everything it needs to elect us master right now: Announce and Signaling
+    /// first, then a Sync/Follow_Up pair so it can start measuring offset without waiting for the
+    /// next 125 ms tick. Ordering matters — Announce must precede Sync or the Sync is discarded.
+    /// </summary>
+    private void SendInitialBurstTo(IPAddress address)
+    {
+        try
+        {
+            _generalSocket.SendTo(BuildAnnounce(ClockId, unchecked((ushort)Interlocked.Increment(ref _announceSeq))), new IPEndPoint(address, GeneralPort));
+            _generalSocket.SendTo(BuildSignaling(ClockId, unchecked((ushort)Interlocked.Increment(ref _signalingSeq))), new IPEndPoint(address, GeneralPort));
+
+            ushort seq = unchecked((ushort)Interlocked.Increment(ref _syncSeq));
+            _eventSocket.SendTo(BuildSync(ClockId, seq), new IPEndPoint(address, EventPort));
+            var ts = MonotonicClock.Now;
+            _generalSocket.SendTo(BuildFollowUp(ClockId, seq, ts), new IPEndPoint(address, GeneralPort));
+        }
+        catch (SocketException ex)
+        {
+            // The scheduled loops will reach it shortly; this is an optimisation, not the only path.
+            Diagnostic?.Invoke($"ptp: initial burst to {address} failed ({ex.SocketErrorCode})");
+        }
+        catch (ObjectDisposedException) { /* shutting down */ }
     }
 
     private void SendToPeers(Socket socket, int port, byte[] message)
@@ -203,20 +372,50 @@ public sealed class PtpMaster : IDisposable
 
     // ------------------------------------------------------------ receive
 
+    /// <summary>
+    /// Runs a clock loop so that its failure is reported instead of vanishing. A bare
+    /// <c>Task.Run</c> whose task nobody awaits discards the exception that ended it, which for
+    /// this class means the grandmaster silently stops serving time.
+    /// </summary>
+    private async Task SuperviseAsync(string what, Func<CancellationToken, Task> loop, CancellationToken ct)
+    {
+        try { await loop(ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }   // torn down underneath us
+        catch (Exception ex) { Diagnostic?.Invoke($"{what} stopped: {ex.Message}"); }
+    }
+
+    /// <summary>Longest pause between retries after repeated socket failures.</summary>
+    private static readonly TimeSpan MaxReceiveBackoff = TimeSpan.FromSeconds(2);
+
     private async Task ReceiveLoopAsync(Socket socket, CancellationToken ct)
     {
         byte[] buf = new byte[512];
         EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+        var backoff = TimeSpan.Zero;
         while (!ct.IsCancellationRequested)
         {
             SocketReceiveFromResult r;
             try
             {
                 r = await socket.ReceiveFromAsync(buf, SocketFlags.None, any, ct).ConfigureAwait(false);
+                backoff = TimeSpan.Zero;
             }
             catch (OperationCanceledException) { return; }
-            catch (SocketException) { continue; }
             catch (ObjectDisposedException) { return; }
+            catch (SocketException)
+            {
+                // Retrying immediately was a busy-wait whenever the socket entered a persistently
+                // failing state — the bound interface going away on a network change, which is
+                // precisely when it happens. A spinning core is not something a background tray
+                // app can afford, least of all while it is also pumping audio.
+                backoff = backoff == TimeSpan.Zero
+                    ? TimeSpan.FromMilliseconds(20)
+                    : (backoff < MaxReceiveBackoff ? backoff + backoff : MaxReceiveBackoff);
+                try { await Task.Delay(backoff, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                continue;
+            }
             if (r.ReceivedBytes < 34) continue;
 
             var from = ((IPEndPoint)r.RemoteEndPoint).Address;
@@ -226,25 +425,57 @@ public sealed class PtpMaster : IDisposable
                     state.LastSeen = DateTime.UtcNow;
             }
 
-            switch (buf[0] & 0x0F)
+            // Answering one peer must never end the loop. These sends go straight back to a
+            // device on the LAN, so they throw for entirely ordinary reasons — a speaker
+            // switched off mid-exchange, a Wi-Fi roam, a route that vanished. Unguarded, the
+            // first such throw killed this receive loop for good, and with it every future
+            // Delay_Req from EVERY receiver: the remaining speakers could no longer measure
+            // their offset to our clock, so they drifted apart with nothing reported.
+            try
             {
-                case 0x01: // Delay_Req → Delay_Resp on the general port
-                    if (r.ReceivedBytes < 44) break;
-                    _generalSocket.SendTo(BuildDelayResp(ClockId, buf.AsSpan(0, r.ReceivedBytes), MonotonicClock.Now),
-                        new IPEndPoint(from, GeneralPort));
-                    if (Interlocked.Increment(ref _delayReqsAnswered) == 1)
-                        Diagnostic?.Invoke($"ptp: first Delay_Req from {from} — receiver is slaving to our clock");
-                    break;
-                case 0x02: // PDelay_Req → PDelay_Resp (event) + PDelay_Resp_Follow_Up (general)
-                    if (r.ReceivedBytes < 44) break;
-                    _eventSocket.SendTo(BuildPDelayResp(ClockId, 0x03, buf.AsSpan(0, r.ReceivedBytes)),
-                        new IPEndPoint(from, EventPort));
-                    _generalSocket.SendTo(BuildPDelayResp(ClockId, 0x0A, buf.AsSpan(0, r.ReceivedBytes)),
-                        new IPEndPoint(from, GeneralPort));
-                    break;
-                // Announce/Sync/Follow_Up/Signaling from others: ignored. We claim
-                // clockClass 6 (GPS) so every AirPlay device yields BMCA to us.
+                switch (buf[0] & 0x0F)
+                {
+                    case 0x01: // Delay_Req → Delay_Resp on the general port
+                        if (r.ReceivedBytes < 44) break;
+                        _generalSocket.SendTo(BuildDelayResp(ClockId, buf.AsSpan(0, r.ReceivedBytes), MonotonicClock.Now),
+                            new IPEndPoint(from, GeneralPort));
+                        Interlocked.Increment(ref _delayReqsAnswered);
+                        // Per PEER, not per process. Logging only the very first one made this
+                        // diagnostic useless for the question it exists to answer — "did THIS
+                        // speaker lock onto our clock?" — because the grandmaster is shared, so
+                        // one receiver's success hid every other receiver's silence.
+                        lock (_peersLock)
+                        {
+                            if (_peers.TryGetValue(from, out var counted))
+                            {
+                                counted.DelayReqCount++;
+                                for (int i = counted.SettleWaiters.Count - 1; i >= 0; i--)
+                                    if (counted.DelayReqCount >= counted.SettleWaiters[i].Target)
+                                    {
+                                        counted.SettleWaiters[i].Tcs.TrySetResult(true);
+                                        counted.SettleWaiters.RemoveAt(i);
+                                    }
+                            }
+                            if (_peers.TryGetValue(from, out var peer) && !peer.SlavedLogged)
+                            {
+                                peer.SlavedLogged = true;
+                                Diagnostic?.Invoke($"ptp: {from} is slaving to our clock (Delay_Req received)");
+                            }
+                        }
+                        break;
+                    case 0x02: // PDelay_Req → PDelay_Resp (event) + PDelay_Resp_Follow_Up (general)
+                        if (r.ReceivedBytes < 44) break;
+                        _eventSocket.SendTo(BuildPDelayResp(ClockId, 0x03, buf.AsSpan(0, r.ReceivedBytes)),
+                            new IPEndPoint(from, EventPort));
+                        _generalSocket.SendTo(BuildPDelayResp(ClockId, 0x0A, buf.AsSpan(0, r.ReceivedBytes)),
+                            new IPEndPoint(from, GeneralPort));
+                        break;
+                    // Announce/Sync/Follow_Up/Signaling from others: ignored. We claim
+                    // clockClass 6 (GPS) so every AirPlay device yields BMCA to us.
+                }
             }
+            catch (SocketException) { }        // that peer is unreachable this instant; others are not
+            catch (ObjectDisposedException) { return; }
         }
     }
 

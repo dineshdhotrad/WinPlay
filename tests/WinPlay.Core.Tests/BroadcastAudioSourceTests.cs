@@ -21,6 +21,33 @@ public class BroadcastAudioSourceTests
         public void Dispose() => Disposed = true;
     }
 
+    /// <summary>A source whose FlushToLive is observable, to verify WHEN it gets called.</summary>
+    private sealed class FlushableCountingSource : IAudioSource, IFlushableAudioSource
+    {
+        private long _position;
+        public int FlushCount { get; private set; }
+
+        public void Read(Span<short> interleavedStereo)
+        {
+            for (int i = 0; i < interleavedStereo.Length; i++)
+                interleavedStereo[i] = unchecked((short)_position++);
+        }
+
+        public void FlushToLive() => FlushCount++;
+
+        public void Dispose() { }
+    }
+
+    /// <summary>A source that reports a fixed capture latency, to verify a branch handed out by
+    /// <see cref="BroadcastAudioSource.CreateBranch"/> forwards it rather than silently reading as
+    /// unreported.</summary>
+    private sealed class LatencyReportingSource(double latencySeconds) : IAudioSource, ICaptureLatency
+    {
+        public double CaptureLatencySeconds => latencySeconds;
+        public void Read(Span<short> interleavedStereo) => interleavedStereo.Clear();
+        public void Dispose() { }
+    }
+
     [Fact]
     public void TwoBranches_ReceiveIdenticalSamples()
     {
@@ -86,6 +113,81 @@ public class BroadcastAudioSourceTests
     }
 
     [Fact]
+    public void Branches_Taken_At_Different_Times_Report_Different_Start_Offsets()
+    {
+        // The multi-destination echo fix hinges on this: a branch created LATER, once the shared
+        // capture is already flowing, must know how far along the timeline it started — otherwise
+        // every destination stamps its own first sample as "frame 0" and two destinations play
+        // different content at the same rtp timestamp.
+        using var broadcast = new BroadcastAudioSource(new CountingSource());
+        var early = (IPositionedAudioSource)broadcast.CreateBranch();
+
+        short[] buf = new short[704]; // 352 frames, interleaved stereo
+        ((IAudioSource)early).Read(buf); // advances the shared capture's live position by 352 frames
+
+        var late = (IPositionedAudioSource)broadcast.CreateBranch();
+
+        Assert.Equal(0, early.StartPositionFrames);
+        Assert.Equal(352, late.StartPositionFrames);
+        Assert.NotEqual(early.StartPositionFrames, late.StartPositionFrames);
+    }
+
+    [Fact]
+    public void FlushToLive_Reseats_The_Branch_And_Its_Reported_Start_Offset()
+    {
+        // A branch is typically created BEFORE its destination's connect handshake and flushed
+        // AFTER — the gap between the two must not become backlog, and StartPositionFrames must
+        // reflect where the branch will actually start reading from, not where it was created.
+        using var broadcast = new BroadcastAudioSource(new CountingSource());
+        var early = broadcast.CreateBranch();
+        short[] buf = new short[704];
+        early.Read(buf); // produced = 704 samples = 352 frames
+
+        var branch = broadcast.CreateBranch(); // created at 352 frames
+        early.Read(buf); // produced = 1408 samples = 704 frames, while `branch` sits idle
+
+        ((IFlushableAudioSource)branch).FlushToLive();
+
+        Assert.Equal(704, ((IPositionedAudioSource)branch).StartPositionFrames);
+        branch.Read(buf);
+        Assert.Equal(unchecked((short)1408), buf[0]); // reads live content, not its creation-time backlog
+    }
+
+    [Fact]
+    public void FlushToLive_On_An_Idle_Capture_Also_Flushes_The_Inner_Source()
+    {
+        // Real time passes between the capture being constructed and the first flush (an RTSP
+        // handshake, a volume round-trip). Nothing has been produced yet, so that gap sits entirely
+        // inside the wrapped device-level source's own ring — re-aiming only the branch's cursor
+        // (already 0) would discard nothing. The inner source must be flushed too.
+        var inner = new FlushableCountingSource();
+        using var broadcast = new BroadcastAudioSource(inner);
+        var branch = broadcast.CreateBranch();
+
+        ((IFlushableAudioSource)branch).FlushToLive();
+
+        Assert.Equal(1, inner.FlushCount);
+    }
+
+    [Fact]
+    public void FlushToLive_On_An_Already_Producing_Capture_Does_Not_Disturb_The_Inner_Source()
+    {
+        // A second destination joining a capture already feeding another must never re-flush the
+        // device-level source — that would yank live content out from under the destination
+        // already consuming it, an audible glitch for someone who was there first.
+        var inner = new FlushableCountingSource();
+        using var broadcast = new BroadcastAudioSource(inner);
+        var first = broadcast.CreateBranch();
+        short[] buf = new short[704];
+        first.Read(buf); // production has started
+
+        var second = broadcast.CreateBranch();
+        ((IFlushableAudioSource)second).FlushToLive();
+
+        Assert.Equal(0, inner.FlushCount);
+    }
+
+    [Fact]
     public void Dispose_DisposesInner_AndBranchesGoSilent()
     {
         var inner = new CountingSource();
@@ -98,5 +200,29 @@ public class BroadcastAudioSourceTests
         buf[0] = 1234;
         branch.Read(buf);
         Assert.All(buf, s => Assert.Equal(0, s)); // silence after dispose, no throw
+    }
+
+    [Fact]
+    public void Branch_Forwards_The_Inner_Sources_Reported_Capture_Latency()
+    {
+        // Part of the mirroring lip-sync fix: MirrorSession reads ICaptureLatency off whatever
+        // SystemAudioMover hands it, which is a branch of this class wrapped again by
+        // SystemAudioMover's own ref-counted handle. If either wrapper dropped the capability
+        // instead of forwarding it, the reported latency would silently read as zero and the fix
+        // would do nothing despite the underlying source reporting a real number.
+        using var broadcast = new BroadcastAudioSource(new LatencyReportingSource(0.075));
+        var branch = broadcast.CreateBranch();
+
+        Assert.Equal(0.075, ((ICaptureLatency)branch).CaptureLatencySeconds);
+    }
+
+    [Fact]
+    public void Branch_Reports_Zero_Latency_When_The_Inner_Source_Cannot_Report_One()
+    {
+        // CountingSource does not implement ICaptureLatency — the degrade-to-today's-behaviour path.
+        using var broadcast = new BroadcastAudioSource(new CountingSource());
+        var branch = broadcast.CreateBranch();
+
+        Assert.Equal(0, ((ICaptureLatency)branch).CaptureLatencySeconds);
     }
 }

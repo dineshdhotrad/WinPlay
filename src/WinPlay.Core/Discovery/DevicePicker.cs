@@ -39,13 +39,13 @@ public sealed class PickerEntry
 }
 
 /// <summary>
-/// The Control Center collapse algorithm (plan §3.2):
-///  1. receivers sharing a `gid` form one group; `pgid` folds nested groups under parents;
-///  2. the `igl=1` member is the leader (session endpoint);
-///  3. a two-member all-HomePod group sharing a `tsid` is a stereo pair;
-///  4. label = `gpn` (group public name), falling back to the leader's name.
+/// The Control Center collapse algorithm:
+/// 1. receivers sharing a `gid` form one group; `pgid` folds nested groups under parents;
+/// 2. the `igl=1` member is the leader (session endpoint);
+/// 3. a two-member all-HomePod group sharing a `tsid` is a stereo pair;
+/// 4. label = `gpn` (group public name), falling back to the leader's name.
 ///
-/// Caveat (documented in the plan): the exact field Apple uses to label "stereo pair" vs
+/// Caveat: the exact field Apple uses to label "stereo pair" vs
 /// "multi-room" is not fully public; gid + tsid + AudioAccessory model is the accepted
 /// heuristic (cross-referenced with owntone issue #1413).
 /// </summary>
@@ -58,6 +58,14 @@ public static class DevicePicker
             .GroupBy(d => d.ParentGroupId ?? d.GroupId ?? $"device:{d.DeviceId}")
             .Select(g => g.ToList())
             .ToList();
+
+        // A leader can advertise a COMPOUND gid — its own id plus a partner's, joined by '+'
+        // (confirmed on real hardware: a HomePod mini advertising `igl=1`/`gcgl=1` and
+        // "<self>+<partner>"). The exact grouping above only matches whole gid strings, so a
+        // sibling that is genuinely present but advertises just its own (component) id falls
+        // through to a separate row instead of fusing with its leader. Re-merge any groups
+        // whose gids share a '+'-split component.
+        MergeByCompoundGroupId(grouped);
 
         // A physical stereo pair is identified by a shared tight-sync id (tsid) — a stable
         // property of how it was set up, independent of playback. While streaming, a pair's
@@ -120,6 +128,39 @@ public static class DevicePicker
             }
         }
     }
+
+    /// <summary>
+    /// Merges any groups whose gids share a '+'-split component, so a genuinely present sibling
+    /// named only by a leader's compound gid (e.g. leader advertises "A+B", sibling advertises
+    /// plain "B") fuses into one multi-member entry instead of the leader falling through to the
+    /// solo path with a group id its own firmware still believes is real. Splitting is applied to
+    /// BOTH sides symmetrically, so the merge is order-independent regardless of which device (the
+    /// compound one or the plain one) appears first in <paramref name="groups"/>. A device with no
+    /// gid, or a group with no cross-group component match, is untouched. Mutates
+    /// <paramref name="groups"/> in place.
+    /// </summary>
+    private static void MergeByCompoundGroupId(List<List<AirPlayDevice>> groups)
+    {
+        for (int i = 0; i < groups.Count; i++)
+        {
+            var components = GroupIdComponents(groups[i]);
+            if (components.Count == 0) continue;
+            for (int j = groups.Count - 1; j > i; j--)
+            {
+                if (GroupIdComponents(groups[j]).Overlaps(components))
+                {
+                    groups[i].AddRange(groups[j]);
+                    groups.RemoveAt(j);
+                }
+            }
+        }
+    }
+
+    /// <summary>Every '+'-split token across a group's members' gids (a plain gid splits to itself).</summary>
+    private static HashSet<string> GroupIdComponents(List<AirPlayDevice> group) =>
+        group.Where(d => d.GroupId is { Length: > 0 })
+            .SelectMany(d => d.GroupId!.Split('+', StringSplitOptions.RemoveEmptyEntries))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     private static PickerEntryKind KindOf(List<AirPlayDevice> members)
     {

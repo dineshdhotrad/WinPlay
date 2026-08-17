@@ -13,8 +13,24 @@ public interface IH264VideoSource : IAsyncDisposable
     int Width { get; }
     int Height { get; }
 
-    /// <summary>Raised for each encoded access unit: (Annex-B bytes, isKeyframe).</summary>
-    event Action<ReadOnlyMemory<byte>, bool>? FrameEncoded;
+    /// <summary>
+    /// Raised for each encoded access unit: (Annex-B bytes, isKeyframe, captureTicks). captureTicks
+    /// is a <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> value taken at the moment the
+    /// frame was captured (not encoded-and-delivered) — QueryPerformanceCounter is machine-wide on
+    /// Windows, so this is directly comparable to the consuming session's own clock even when the
+    /// source runs in a different (capture-host) process. Consumers use it to timestamp the frame
+    /// from its true capture instant rather than from whenever this event happens to be observed,
+    /// so pipe/queueing delay between capture and here cannot silently skew A/V sync.
+    /// </summary>
+    event Action<ReadOnlyMemory<byte>, bool, long>? FrameEncoded;
+
+    /// <summary>
+    /// Capture has stopped for good and no further frames will arrive. The session must surface
+    /// this rather than wait: a source that silently produces nothing is indistinguishable, from
+    /// the outside, from a mirror that is simply still starting — which is how "click Mirror, and
+    /// nothing whatsoever happens" became a supported outcome.
+    /// </summary>
+    event Action<Exception>? Failed;
 
     /// <summary>
     /// Negotiated receiver constraints, applied before <see cref="StartAsync"/>: the

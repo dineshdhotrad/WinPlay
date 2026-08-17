@@ -1,15 +1,11 @@
 # Screenshots
 
-The README references four screenshots from this folder. Capture them from a live session
-and save with these exact names:
+The repository README references the screenshots in this folder. Current set (0.2.0 UI):
 
-| File | What to capture |
+| File | Shows |
 |---|---|
-| `picker.png` | The tray flyout open, showing the device picker with a stereo pair / group collapsed into single rows. |
-| `streaming-audio.png` | A destination actively streaming (checked, with the volume slider and "Streaming…" status visible). |
-| `Hover-Names.png` | The device list with a row hovered, showing the per-device tooltip / member names. |
-| `mirroring.png` | The desktop mirrored on an Apple TV (a photo of the TV, or the mirroring status in the app). |
+| `tv-modes.png` | The tray picker: Now Playing surface, device list, and the Apple TV row's Audio / Screen / Both mode selector with per-destination volume. |
+| `pin-pairing.png` | The one-time PIN pairing dialog for an Apple TV, over the picker. |
 
-Tips: use a clean desktop, the dark theme suits the icon's palette, and 2× DPI looks
-crispest. Optional extras (`pairing.png`, `nowplaying.png`) are welcome — reference them in
-the README if you add them.
+Capture guidelines: 2560x1440 desktop, dark theme, flyout open over a clean wallpaper,
+PNG. Recapture whenever the picker UI changes materially.

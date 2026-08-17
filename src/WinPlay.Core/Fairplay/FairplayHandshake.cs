@@ -32,7 +32,7 @@ public sealed class FairplaySession
 /// <summary>
 /// Drives Apple's FairPlay SAP (Session Authentication Protocol) handshake for AirPlay
 /// screen mirroring: POST m1 → m2, compute m3 (white-box exchange), POST m3 → m4, then
-/// unwrap the stream key. This is the "single hardest and riskiest" part of the plan;
+/// unwrap the stream key. This is the hardest part of the protocol to implement;
 /// the whitebox core is a clean-room port of doubletake and is verified offline against
 /// golden vectors. Only Apple TV / AirPlay-2 TVs implement /fp-setup — HomePods 404 it.
 /// </summary>

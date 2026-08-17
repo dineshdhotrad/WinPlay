@@ -5,17 +5,17 @@ using Xunit;
 namespace WinPlay.Core.Tests;
 
 /// <summary>
-/// Collapse tests over a fixture mirroring the real LAN this project is verified on:
-/// a standalone HomePod mini, a HomePod stereo pair ("Study"), an Apple TV–led group
-/// containing a nested stereo pair ("Living Room TV", 3 devices), and a Shairport
-/// third-party speaker.
+/// Collapse tests over a fixture representing a typical AirPlay LAN topology:
+/// a standalone HomePod mini, a HomePod stereo pair ("Office"), an Apple TV–led group
+/// containing a nested stereo pair ("Den TV", 3 devices), and a third-party
+/// Shairport speaker.
 /// </summary>
 public class DevicePickerTests
 {
-    private const string StudyGid = "A9C37DDC-F1B3-5FE1-96FC-321C7FCF3E4E+1+3728F550-2993-4FF9-AC16-DC4E8D34F5E4";
-    private const string StudyTsid = "A9C37DDC-F1B3-5FE1-96FC-321C7FCF3E4E";
-    private const string LrGid = "06A7D64E-AB1E-53D4-AA95-ABF92A31496D";
-    private const string LrTsid = "56D59835-A691-5CE9-9FC4-81956C6EEC92";
+    private const string OfficeGid = "22222222-2222-2222-2222-222222222222+1+33333333-3333-3333-3333-333333333333";
+    private const string OfficeTsid = "22222222-2222-2222-2222-222222222222";
+    private const string DenGid = "44444444-4444-4444-4444-444444444444";
+    private const string DenTsid = "55555555-5555-5555-5555-555555555555";
 
     private static AirPlayDevice HomePod(string id, string name, string? gid = null, string? gpn = null,
         bool igl = false, string? tsid = null, string? pgid = null) => new()
@@ -27,82 +27,82 @@ public class DevicePickerTests
         ParentGroupContainsLeader = pgid is not null,
     };
 
-    private static List<AirPlayDevice> RealLanFixture() =>
+    private static List<AirPlayDevice> SyntheticLanFixture() =>
     [
-        HomePod("FAA3D5083FF6", "Guest Bedroom", gid: "C548CE8E-1620-4DA2-B9C6-3717631D367C+D420E3B0", igl: true),
-        HomePod("C60A074F5F7F", "SR HomePod R", gid: StudyGid, gpn: "Study", igl: true, tsid: StudyTsid),
-        HomePod("C2D9A60D57E8", "SR HomePod L", gid: StudyGid, gpn: "Study", igl: false, tsid: StudyTsid, pgid: StudyGid),
+        HomePod("AABBCC000001", "Bedroom", gid: "11111111-1111-1111-1111-111111111111+AAAA0001", igl: true),
+        HomePod("AABBCC000002", "Office HomePod R", gid: OfficeGid, gpn: "Office", igl: true, tsid: OfficeTsid),
+        HomePod("AABBCC000003", "Office HomePod L", gid: OfficeGid, gpn: "Office", igl: false, tsid: OfficeTsid, pgid: OfficeGid),
         new AirPlayDevice
         {
-            DeviceId = "869EB3F567EC", Name = "Living Room TV", Model = "AppleTV11,1",
+            DeviceId = "AABBCC000004", Name = "Den TV", Model = "AppleTV11,1",
             RawFeatures = (ulong)(AirPlayFeatures.SupportsAirPlayAudio | AirPlayFeatures.SupportsAirPlayScreen | AirPlayFeatures.SupportsPtp),
-            GroupId = LrGid, GroupPublicName = "Living Room TV", IsGroupLeader = true, GroupContainsLeader = true,
+            GroupId = DenGid, GroupPublicName = "Den TV", IsGroupLeader = true, GroupContainsLeader = true,
         },
-        HomePod("8E1A6B7EA5C1", "Living Room", gid: LrGid, gpn: "Living Room TV", tsid: LrTsid, pgid: LrGid),
-        HomePod("92348FA7104F", "Living Room (3)", gid: LrGid, gpn: "Living Room TV", tsid: LrTsid, pgid: LrGid),
+        HomePod("AABBCC000005", "Den", gid: DenGid, gpn: "Den TV", tsid: DenTsid, pgid: DenGid),
+        HomePod("AABBCC000006", "Den (3)", gid: DenGid, gpn: "Den TV", tsid: DenTsid, pgid: DenGid),
         new AirPlayDevice
         {
-            DeviceId = "2CCF6735D31E", Name = "Korus Living Room", Model = "Shairport Sync",
+            DeviceId = "AABBCC000007", Name = "Kitchen Speaker", Model = "Shairport Sync",
             RawFeatures = (ulong)(AirPlayFeatures.SupportsAirPlayAudio | AirPlayFeatures.HasUnifiedAdvertiserInfo),
-            GroupId = "6393961f-b83c-43d9-9929-88a880cea36c",
+            GroupId = "66666666-6666-6666-6666-666666666666",
         },
     ];
 
     [Fact]
     public void Seven_Devices_Collapse_To_Four_Rows()
     {
-        var entries = DevicePicker.Collapse(RealLanFixture());
+        var entries = DevicePicker.Collapse(SyntheticLanFixture());
         Assert.Equal(4, entries.Count);
-        Assert.Equal(["Guest Bedroom", "Korus Living Room", "Living Room TV", "Study"],
+        Assert.Equal(["Bedroom", "Den TV", "Kitchen Speaker", "Office"],
             entries.Select(e => e.DisplayName).ToArray());
     }
 
     [Fact]
     public void Stereo_Pair_Is_One_Row_With_Leader_First()
     {
-        var study = DevicePicker.Collapse(RealLanFixture()).Single(e => e.DisplayName == "Study");
+        var office = DevicePicker.Collapse(SyntheticLanFixture()).Single(e => e.DisplayName == "Office");
 
-        Assert.Equal(PickerEntryKind.StereoPair, study.Kind);
-        Assert.Equal("Stereo Pair", study.Subtitle);
-        Assert.Equal(2, study.Members.Count);
-        Assert.Equal("C60A074F5F7F", study.Leader.DeviceId);       // igl=1 → R is leader
-        Assert.Same(study.Leader, study.Members[0]);
-        Assert.True(study.IsAudioCapable);
-        Assert.False(study.IsMirroringCapable);
+        Assert.Equal(PickerEntryKind.StereoPair, office.Kind);
+        Assert.Equal("Stereo Pair", office.Subtitle);
+        Assert.Equal(2, office.Members.Count);
+        Assert.Equal("AABBCC000002", office.Leader.DeviceId);       // igl=1 → R is leader
+        Assert.Same(office.Leader, office.Members[0]);
+        Assert.True(office.IsAudioCapable);
+        Assert.False(office.IsMirroringCapable);
     }
 
     [Fact]
     public void AppleTv_Led_Group_Collapses_Nested_Pair_And_Is_Mirroring_Eligible()
     {
-        var lr = DevicePicker.Collapse(RealLanFixture()).Single(e => e.DisplayName == "Living Room TV");
+        var den = DevicePicker.Collapse(SyntheticLanFixture()).Single(e => e.DisplayName == "Den TV");
 
-        Assert.Equal(PickerEntryKind.Group, lr.Kind);
-        Assert.Equal(3, lr.Members.Count);
-        Assert.Equal("3 devices", lr.Subtitle);
-        Assert.Equal("869EB3F567EC", lr.Leader.DeviceId);          // the Apple TV leads
-        Assert.Equal(AirPlayDeviceSubtype.AppleTv, lr.Leader.Subtype);
-        Assert.True(lr.IsMirroringCapable);
+        Assert.Equal(PickerEntryKind.Group, den.Kind);
+        Assert.Equal(3, den.Members.Count);
+        Assert.Equal("3 devices", den.Subtitle);
+        Assert.Equal("AABBCC000004", den.Leader.DeviceId);          // the Apple TV leads
+        Assert.Equal(AirPlayDeviceSubtype.AppleTv, den.Leader.Subtype);
+        Assert.True(den.IsMirroringCapable);
     }
 
     [Fact]
     public void Standalone_HomePod_With_Own_Gid_Is_Single()
     {
-        var guest = DevicePicker.Collapse(RealLanFixture()).Single(e => e.DisplayName == "Guest Bedroom");
+        var bedroom = DevicePicker.Collapse(SyntheticLanFixture()).Single(e => e.DisplayName == "Bedroom");
 
-        Assert.Equal(PickerEntryKind.Single, guest.Kind);
-        Assert.Equal("HomePod mini", guest.Subtitle);
-        Assert.False(guest.IsMirroringCapable);
+        Assert.Equal(PickerEntryKind.Single, bedroom.Kind);
+        Assert.Equal("HomePod mini", bedroom.Subtitle);
+        Assert.False(bedroom.IsMirroringCapable);
     }
 
     [Fact]
     public void Leaderless_Third_Party_Speaker_Still_Gets_A_Row()
     {
-        var korus = DevicePicker.Collapse(RealLanFixture()).Single(e => e.DisplayName == "Korus Living Room");
+        var kitchen = DevicePicker.Collapse(SyntheticLanFixture()).Single(e => e.DisplayName == "Kitchen Speaker");
 
-        Assert.Equal(PickerEntryKind.Single, korus.Kind);
-        Assert.Same(korus.Leader, korus.Members[0]);
-        Assert.True(korus.IsAudioCapable);
-        Assert.False(korus.IsMirroringCapable);
+        Assert.Equal(PickerEntryKind.Single, kitchen.Kind);
+        Assert.Same(kitchen.Leader, kitchen.Members[0]);
+        Assert.True(kitchen.IsAudioCapable);
+        Assert.False(kitchen.IsMirroringCapable);
     }
 
     [Fact]
@@ -131,6 +131,29 @@ public class DevicePickerTests
     }
 
     [Fact]
+    public void Compound_Gid_Fuses_A_Genuinely_Present_Sibling()
+    {
+        // Reproduces a real-world compound-gid TXT record: a HomePod mini advertises a
+        // COMPOUND gid ("<self>+<partner>") because its firmware still believes it belongs to
+        // a live group. Before this fix DevicePicker only matched whole gid strings, so a
+        // partner that is genuinely present but advertises just its own (component) id fell
+        // through to a separate row instead of fusing with its leader. When that partner IS
+        // visible on the LAN, the two must collapse into one multi-member entry.
+        const string leaderId = "AA11BB22CC33-DD44-EE55-FF66-001122334455";
+        const string partnerId = "99887766-5544-3322-1100-AABBCCDDEEFF";
+        List<AirPlayDevice> devices =
+        [
+            HomePod("AA11BB22CC33", "Bedroom", gid: $"{leaderId}+{partnerId}", igl: true),
+            HomePod("998877665544", "Bedroom Partner", gid: partnerId),
+        ];
+
+        var entry = Assert.Single(DevicePicker.Collapse(devices));
+        Assert.Equal(PickerEntryKind.Group, entry.Kind);
+        Assert.Equal(2, entry.Members.Count);
+        Assert.Equal("AA11BB22CC33", entry.Leader.DeviceId);
+    }
+
+    [Fact]
     public void Pair_Members_With_Divergent_Gids_Still_Collapse_To_One_Row()
     {
         // Reproduces the streaming bug: while a pair is receiving audio its members can
@@ -138,13 +161,13 @@ public class DevicePickerTests
         // (not split into two) — and keep the same stable Key so the UI updates in place.
         List<AirPlayDevice> idle =
         [
-            HomePod("C60A074F5F7F", "SR HomePod R", gid: StudyGid, gpn: "Study", igl: true, tsid: StudyTsid),
-            HomePod("C2D9A60D57E8", "SR HomePod L", gid: StudyGid, gpn: "Study", tsid: StudyTsid, pgid: StudyGid),
+            HomePod("AABBCC000002", "Office HomePod R", gid: OfficeGid, gpn: "Office", igl: true, tsid: OfficeTsid),
+            HomePod("AABBCC000003", "Office HomePod L", gid: OfficeGid, gpn: "Office", tsid: OfficeTsid, pgid: OfficeGid),
         ];
         List<AirPlayDevice> streaming =
         [
-            HomePod("C60A074F5F7F", "SR HomePod R", gid: "NOW-PLAYING-R", igl: true, tsid: StudyTsid),
-            HomePod("C2D9A60D57E8", "SR HomePod L", gid: "NOW-PLAYING-L", tsid: StudyTsid),
+            HomePod("AABBCC000002", "Office HomePod R", gid: "NOW-PLAYING-R", igl: true, tsid: OfficeTsid),
+            HomePod("AABBCC000003", "Office HomePod L", gid: "NOW-PLAYING-L", tsid: OfficeTsid),
         ];
 
         var idleEntry = Assert.Single(DevicePicker.Collapse(idle));

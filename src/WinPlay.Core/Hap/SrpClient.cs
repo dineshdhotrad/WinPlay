@@ -44,9 +44,9 @@ public sealed record SrpGroup(BigInteger N, BigInteger G, int PrimeBytes)
 /// username "Pair-Setup", and the fixed PIN "3939" for transient pairing.
 ///
 /// M1/M2/K use the csrp-lineage convention every known-good AirPlay 2 sender ships:
-///   K  = H(S)                                       (S unpadded)
-///   M1 = H( H(N)⊕H(g) | H(I) | s | A | B | K )      (A, B, g unpadded)
-///   M2 = H( A | M1 | K )
+/// K = H(S) (S unpadded)
+/// M1 = H( H(N)⊕H(g) | H(I) | s | A | B | K ) (A, B, g unpadded)
+/// M2 = H( A | M1 | K )
 /// The core math (x, k, u, S) is validated against the RFC 5054 appendix-B vector.
 /// </summary>
 public sealed class SrpClient
