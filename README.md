@@ -165,6 +165,12 @@ does not yet cryptographically pin the receiver's identity across sessions — s
 Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [code of conduct](CODE_OF_CONDUCT.md).
 
+## Support WinPlay
+
+WinPlay is free and open source, built in the open. If it earned a place in your setup,
+you can support continued development over on **[Ko-fi ☕](https://ko-fi.com/thedinesh)** —
+every bit is appreciated and keeps the project moving.
+
 ## Acknowledgements
 
 WinPlay contains **no Apple source or key material.** It stands on the shoulders of the

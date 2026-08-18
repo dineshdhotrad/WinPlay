@@ -4,6 +4,17 @@ All notable changes to WinPlay are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-08-18
+
+Maintenance release — functionally identical to 0.1.0. The v0.2.0 release has been
+withdrawn because of audio playback regressions; its features will return in a future
+release once they meet the quality bar. If you installed 0.2.0, install this build over it.
+
+### Added
+
+- **Support link** — a Sponsor button on the repository and a "Support WinPlay" section in
+  the README, pointing to [Ko-fi](https://ko-fi.com/thedinesh).
+
 ## [0.1.0] — 2026-07-20
 
 First public release. A native Windows AirPlay 2 sender.
@@ -33,4 +44,5 @@ First public release. A native Windows AirPlay 2 sender.
 - Audio is not yet streamed alongside screen mirroring.
 - Receiver identity is not pinned across sessions (same‑LAN trust model).
 
+[0.1.1]: https://github.com/dineshdhotrad/WinPlay/releases/tag/v0.1.1
 [0.1.0]: https://github.com/dineshdhotrad/WinPlay/releases/tag/v0.1.0

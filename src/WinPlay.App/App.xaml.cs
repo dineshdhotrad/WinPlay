@@ -68,7 +68,7 @@ public partial class App : Application
 
     private IReadOnlyList<TrayMenuItem> BuildTrayMenu()
     {
-        string version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.0";
+        string version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.1";
         return
         [
             new TrayMenuItem { Text = "Open WinPlay", IsDefault = true, Clicked = () => _dispatcher?.TryEnqueue(() => _flyout?.ShowNearTray()) },

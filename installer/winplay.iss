@@ -2,10 +2,10 @@
 ; WinPlay installer (Inno Setup). Per-user install — no administrator rights, so Windows
 ; does not show a UAC prompt. Bundles the self-contained build (no .NET prerequisite).
 ;
-; Build:  ISCC.exe /DSourceDir=<publish folder> /DAppVersion=0.1.0 winplay.iss
+; Build:  ISCC.exe /DSourceDir=<publish folder> /DAppVersion=0.1.1 winplay.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\publish\win-x64"
