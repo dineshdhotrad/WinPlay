@@ -51,6 +51,35 @@ public static class H264
 
     public static bool ContainsKeyframe(IEnumerable<byte[]> nals) => nals.Any(n => NalType(n) == NalIdr);
 
+    /// <summary>
+    /// Scans an Annex-B buffer in-place for an IDR keyframe (NAL type 5) without allocating
+    /// a NAL list or copying slices.
+    /// </summary>
+    public static bool ContainsKeyframeAnnexB(ReadOnlySpan<byte> data)
+    {
+        int i = 0, n = data.Length;
+        while (i + 4 <= n)
+        {
+            if (data[i] == 0 && data[i + 1] == 0)
+            {
+                if (data[i + 2] == 1)
+                {
+                    if ((data[i + 3] & 0x1f) == NalIdr) return true;
+                    i += 4;
+                    continue;
+                }
+                if (i + 4 < n && data[i + 2] == 0 && data[i + 3] == 1)
+                {
+                    if ((data[i + 4] & 0x1f) == NalIdr) return true;
+                    i += 5;
+                    continue;
+                }
+            }
+            i++;
+        }
+        return false;
+    }
+
     /// <summary>Concatenates NAL units in AVCC form (4-byte big-endian length prefix each).</summary>
     public static byte[] ToAvcc(IEnumerable<byte[]> nals)
     {

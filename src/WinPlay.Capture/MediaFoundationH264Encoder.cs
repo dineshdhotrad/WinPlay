@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
+using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
 
 namespace WinPlay.Capture;
@@ -8,8 +9,7 @@ namespace WinPlay.Capture;
 /// <summary>
 /// Software Media Foundation H.264 encoder (Microsoft's encoder MFT, always present) —
 /// the fallback when no hardware encoder is available. NV12 frames in, Annex-B access
-/// units out. Synchronous ProcessInput/ProcessOutput drain, surfaced through the shared
-/// <see cref="IH264Encoder"/> event interface.
+/// units out via a reusable buffer.
 /// </summary>
 internal sealed class MediaFoundationH264Encoder : IH264Encoder
 {
@@ -29,20 +29,24 @@ internal sealed class MediaFoundationH264Encoder : IH264Encoder
     private static readonly Guid IID_IMFTransform = new("bf94c121-5b05-4e6f-8000-ba598961414d");
 
     private const uint InterlaceProgressive = 2;
-    private const uint ProfileMain = 77;
+    private const uint ProfileBaseline = 66;
 
     private readonly IMFTransform _transform;
     private readonly int _outputBufferSize;
+    private readonly long _frameDuration;
+    private byte[] _annexBScratch = new byte[512 * 1024];
     private long _frameIndex;
 
     public string Name => "H.264 software (Microsoft MFT)";
-    public event Action<byte[]>? Encoded;
+    public bool IsZeroCopy => false;
+    public event Action<ReadOnlyMemory<byte>>? Encoded;
 
     [DllImport("ole32.dll")]
     private static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, ref Guid riid, out IntPtr ppv);
 
     public MediaFoundationH264Encoder(int width, int height, int fps, int bitrate)
     {
+        _frameDuration = 10_000_000L / Math.Max(1, fps);
         MediaFactory.MFStartup(false).CheckError();
 
         Guid clsid = CLSID_CMSH264EncoderMFT, iid = IID_IMFTransform;
@@ -51,14 +55,13 @@ internal sealed class MediaFoundationH264Encoder : IH264Encoder
             throw new InvalidOperationException($"could not create H.264 encoder MFT (hr=0x{hr:X8})");
         _transform = new IMFTransform(ptr);
 
-        // Output type (H.264) must be set before the input type on encoder MFTs.
         using (var outType = MediaFactory.MFCreateMediaType())
         {
             outType.Set(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             outType.Set(MF_MT_SUBTYPE, MFVideoFormat_H264);
             outType.Set(MF_MT_AVG_BITRATE, (uint)bitrate);
             outType.Set(MF_MT_INTERLACE_MODE, InterlaceProgressive);
-            outType.Set(MF_MT_MPEG2_PROFILE, ProfileMain);
+            outType.Set(MF_MT_MPEG2_PROFILE, ProfileBaseline);
             outType.Set(MF_MT_FRAME_SIZE, Pack(width, height));
             outType.Set(MF_MT_FRAME_RATE, Pack(fps, 1));
             outType.Set(MF_MT_PIXEL_ASPECT_RATIO, Pack(1, 1));
@@ -85,8 +88,13 @@ internal sealed class MediaFoundationH264Encoder : IH264Encoder
 
     private static ulong Pack(int high, int low) => ((ulong)(uint)high << 32) | (uint)low;
 
-    /// <summary>Encodes one NV12 frame, raising <see cref="Encoded"/> for each access unit produced.</summary>
-    public void Encode(byte[] nv12)
+    public void EncodeTexture(ID3D11Texture2D nv12Texture) => throw new NotSupportedException();
+
+    public void ForceKeyframe() { }
+
+    public void UpdateBitrate(int bitrateBps) { }
+
+    public void EncodeCpu(byte[] nv12)
     {
         using (var buffer = MediaFactory.MFCreateMemoryBuffer(nv12.Length))
         {
@@ -97,9 +105,8 @@ internal sealed class MediaFoundationH264Encoder : IH264Encoder
 
             using var sample = MediaFactory.MFCreateSample();
             sample.AddBuffer(buffer);
-            const long duration = 10_000_000 / 30;
-            sample.SampleTime = _frameIndex * duration;
-            sample.SampleDuration = duration;
+            sample.SampleTime = _frameIndex * _frameDuration;
+            sample.SampleDuration = _frameDuration;
             _frameIndex++;
             _transform.ProcessInput(0, sample, 0);
         }
@@ -117,16 +124,17 @@ internal sealed class MediaFoundationH264Encoder : IH264Encoder
             var dataBuffer = new OutputDataBuffer { StreamID = 0, Sample = outSample };
             Result result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref dataBuffer, out ProcessOutputStatus _);
 
-            if (result == ResultCode.TransformNeedMoreInput)
+            if (result == Vortice.MediaFoundation.ResultCode.TransformNeedMoreInput)
                 break;
             result.CheckError();
 
             using var converted = dataBuffer.Sample.ConvertToContiguousBuffer();
             converted.Lock(out IntPtr ptr, out int _, out int cur);
-            byte[] annexB = new byte[cur];
-            Marshal.Copy(ptr, annexB, 0, cur);
+            if (cur > _annexBScratch.Length)
+                _annexBScratch = new byte[Math.Max(cur, _annexBScratch.Length * 2)];
+            Marshal.Copy(ptr, _annexBScratch, 0, cur);
             converted.Unlock();
-            Encoded?.Invoke(annexB);
+            Encoded?.Invoke(new ReadOnlyMemory<byte>(_annexBScratch, 0, cur));
         }
     }
 

@@ -26,13 +26,17 @@ public sealed class MirrorSession : IAsyncDisposable
 {
     private const int SampleRate = 44100;
 
-    private readonly RtspConnection _rtsp = new();
+    private RtspConnection _rtsp = new();
     private readonly MirrorClock _clock = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly List<Task> _loops = [];
-    private readonly string _sessionUuid = Guid.NewGuid().ToString().ToUpperInvariant();
-    private readonly long _sessionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
-    private readonly long _videoStreamConnectionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
+    private string _sessionUuid = Guid.NewGuid().ToString().ToUpperInvariant();
+    private long _sessionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
+    private long _videoStreamConnectionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
+    private IPAddress? _remoteAddress;
+    private int _remotePort;
+    private HapPairingCredentials? _credentials;
+    private int _reconnecting;
 
     private HapSession? _hap;
     private FairplaySession? _fairplay;
@@ -63,7 +67,7 @@ public sealed class MirrorSession : IAsyncDisposable
     // handed to a dedicated sender so TCP writes never stall the encoder. Bounded + drop-
     // oldest: for live mirroring a fresh frame beats a backlog.
     private readonly System.Collections.Concurrent.BlockingCollection<byte[]> _sendQueue
-        = new(new System.Collections.Concurrent.ConcurrentQueue<byte[]>(), boundedCapacity: 16);
+        = new(new System.Collections.Concurrent.ConcurrentQueue<byte[]>(), boundedCapacity: 64);
 
     private bool _codecSent;
     private byte[]? _sps;
@@ -71,6 +75,7 @@ public sealed class MirrorSession : IAsyncDisposable
     private long _framesSent;
     private int _receiverDisplayW;
     private int _receiverDisplayH;
+    private string? _receiverModel;
 
     public event Action<string>? StageChanged;
 
@@ -94,7 +99,12 @@ public sealed class MirrorSession : IAsyncDisposable
         HapPairingCredentials credentials, Action<string>? stageChanged = null,
         CancellationToken ct = default, bool withAudio = true)
     {
-        var s = new MirrorSession(withAudio);
+        var s = new MirrorSession(withAudio)
+        {
+            _remoteAddress = address,
+            _remotePort = port,
+            _credentials = credentials,
+        };
         if (stageChanged is not null) s.StageChanged += stageChanged;
         try
         {
@@ -117,7 +127,8 @@ public sealed class MirrorSession : IAsyncDisposable
         info.EnsureSuccess("GET /info");
         var infoDict = BinaryPlist.ReadDictionary(info.Body);
         (_receiverDisplayW, _receiverDisplayH) = ParseDisplaySize(infoDict);
-        Stage($"receiver: {infoDict.GetValueOrDefault("name")} ({infoDict.GetValueOrDefault("model")})"
+        _receiverModel = infoDict.GetValueOrDefault("model") as string;
+        Stage($"receiver: {infoDict.GetValueOrDefault("name")} ({_receiverModel})"
             + (_receiverDisplayW > 0 ? $", display {_receiverDisplayW}x{_receiverDisplayH}" : ", display size not advertised"));
 
         Stage("pair-verify (stored credentials)");
@@ -190,7 +201,7 @@ public sealed class MirrorSession : IAsyncDisposable
                 ["streamConnectionID"] = _videoStreamConnectionId,
                 ["shk"] = shk,
                 ["shiv"] = shiv,
-                ["latencyMs"] = 100L,
+                ["latencyMs"] = 0L,
                 ["timestampInfo"] = new List<object?>
                 {
                     new Dictionary<string, object?> { ["name"] = "SubSu" },
@@ -218,8 +229,8 @@ public sealed class MirrorSession : IAsyncDisposable
                 ["controlPort"] = (long)audioControlPort,
                 ["audioMode"] = "default",
                 ["usingScreen"] = true,
-                ["latencyMin"] = 11025L,
-                ["latencyMax"] = 88200L,
+                ["latencyMin"] = 2205L,
+                ["latencyMax"] = 11025L,
                 ["shk"] = _audioChachaKey,
                 ["isMedia"] = true,
                 ["supportsDynamicStreamID"] = true,
@@ -256,7 +267,7 @@ public sealed class MirrorSession : IAsyncDisposable
         _dataChannel = new TcpClient();
         await _dataChannel.ConnectAsync(_rtsp.RemoteAddress, (int)dataPort, ct).ConfigureAwait(false);
         _dataChannel.NoDelay = true;
-        _dataChannel.SendBufferSize = 64 * 1024;
+        _dataChannel.SendBufferSize = 256 * 1024;
         _dataStream = _dataChannel.GetStream();
 
         Stage("RECORD");
@@ -304,7 +315,7 @@ public sealed class MirrorSession : IAsyncDisposable
     public async Task StartStreamingAsync(IH264VideoSource source, Audio.IAudioSource? audioSource = null)
     {
         _source = source;
-        source.Configure(_receiverDisplayW, _receiverDisplayH);
+        source.ConfigureReceiverProfile(_receiverModel, _receiverDisplayW, _receiverDisplayH);
         source.FrameEncoded += OnFrameEncoded;
         _loops.Add(Task.Run(() => SendLoopAsync(_cts.Token)));
         _loops.Add(Task.Run(() => DataHeartbeatLoopAsync(_cts.Token)));
@@ -391,7 +402,7 @@ public sealed class MirrorSession : IAsyncDisposable
             pkt[0] = first ? (byte)0x90 : (byte)0x80;
             pkt[1] = 0xD4;
             BinaryPrimitives.WriteUInt16BigEndian(pkt.AsSpan(2), 0x0007);
-            BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(4), rtpNow - 11025);
+            BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(4), rtpNow - 2205);
             BinaryPrimitives.WriteUInt64BigEndian(pkt.AsSpan(8), _clock.BootTimestamp);
             BinaryPrimitives.WriteUInt32BigEndian(pkt.AsSpan(16), rtpNow);
             try { await _audioControlSocket!.SendToAsync(pkt, SocketFlags.None, _audioControlRemote!, ct).ConfigureAwait(false); }
@@ -405,6 +416,7 @@ public sealed class MirrorSession : IAsyncDisposable
 
     private void OnFrameEncoded(ReadOnlyMemory<byte> annexB, bool isKeyframe)
     {
+        if (Volatile.Read(ref _reconnecting) != 0 || _cts.IsCancellationRequested) return;
         try
         {
             var nals = H264.SplitAnnexB(annexB.Span);
@@ -438,9 +450,30 @@ public sealed class MirrorSession : IAsyncDisposable
             if (vcl.Count == 0) return;
             byte[] payload = H264.ToAvcc(vcl);
 
-            byte[] header = MirrorVideoStream.BuildVideoHeader(payload.Length + 16, isKeyframe, _clock.FrameTimestamp);
-            byte[] encrypted = _videoCipher!.Seal(header, payload);
-            SendPacket(header, encrypted);
+            // If the TCP send queue is backed up (> 4 frames in flight) and this is a non-IDR
+            // frame, wait briefly rather than dropping after Seal(), because MirrorVideoCipher
+            // increments an implicit per-frame ChaCha20-Poly1305 nonce counter that MUST stay
+            // strictly in lock-step with the Apple TV receiver.
+            // Apply backpressure to the encoder thread if TCP Wi-Fi has >= 3 frames queued
+            // so frame dropping happens in HardwareH264Encoder._pending (on unencoded GPU
+            // surfaces) BEFORE H.264 reference frame encoding and BEFORE ChaCha20-Poly1305
+            // nonce increment. Dropping after Seal() would permanently desynchronize the
+            // receiver's implicit AEAD frame counter.
+            // If the Wi-Fi TCP send queue is backed up (>= 6 frames) on a non-IDR frame,
+            // skip BEFORE calling _videoCipher.Seal() so the implicit ChaCha20-Poly1305
+            // nonce counter is not incremented, and request a fresh IDR keyframe.
+            if (!isKeyframe && _sendQueue.Count >= 6)
+            {
+                _source?.RequestKeyframe();
+                return;
+            }
+
+            lock (_sendQueue)
+            {
+                byte[] header = MirrorVideoStream.BuildVideoHeader(payload.Length + 16, isKeyframe, _clock.FrameTimestamp);
+                byte[] encrypted = _videoCipher!.Seal(header, payload);
+                SendPacket(header, encrypted);
+            }
 
             long n = Interlocked.Increment(ref _framesSent);
             if (n == 1) Stage("first video frame sent");
@@ -458,11 +491,12 @@ public sealed class MirrorSession : IAsyncDisposable
         byte[] packet = new byte[header.Length + payload.Length];
         header.CopyTo(packet, 0);
         payload.CopyTo(packet, header.Length);
-        while (!_sendQueue.TryAdd(packet) && !_cts.IsCancellationRequested)
+        try
         {
-            if (_sendQueue.TryTake(out _)) continue; // make room by dropping the oldest
-            break;
+            _sendQueue.Add(packet, _cts.Token);
         }
+        catch (OperationCanceledException) { }
+        catch (InvalidOperationException) { }
     }
 
     /// <summary>Drains the send queue to the TCP data channel, off the encoder thread.</summary>
@@ -470,16 +504,45 @@ public sealed class MirrorSession : IAsyncDisposable
     {
         try
         {
+            var swWrite = new Stopwatch();
+            long lastStepDownMs = 0;
+            long lastStepUpMs = 0;
+            var swSession = Stopwatch.StartNew();
+
             foreach (byte[] packet in _sendQueue.GetConsumingEnumerable(ct))
             {
                 if (_dataStream is null) continue;
+                int queueDepth = _sendQueue.Count;
+                swWrite.Restart();
                 await _dataStream.WriteAsync(packet, ct).ConfigureAwait(false);
+                double writeMs = swWrite.Elapsed.TotalMilliseconds;
+                long nowMs = swSession.ElapsedMilliseconds;
+
+                // Closed-loop Adaptive Bitrate (ABR):
+                // Step down bitrate by 20% immediately if TCP write latency spikes (> 25 ms)
+                // or send queue backs up (>= 3 frames), with a 1-second cooldown.
+                if ((queueDepth >= 3 || writeMs > 25.0) && nowMs - lastStepDownMs > 1000)
+                {
+                    lastStepDownMs = nowMs;
+                    lastStepUpMs = nowMs;
+                    _source?.AdjustBitrate(0.80);
+                }
+                // Step up bitrate by 10% after 4 seconds of uncongested delivery.
+                else if (queueDepth == 0 && writeMs < 8.0 && nowMs - lastStepDownMs > 4000 && nowMs - lastStepUpMs > 4000)
+                {
+                    lastStepUpMs = nowMs;
+                    _source?.AdjustBitrate(1.10);
+                }
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or InvalidOperationException)
         {
-            if (!ct.IsCancellationRequested) Stage($"data channel closed: {ex.Message}");
+            if (!ct.IsCancellationRequested)
+            {
+                Stage($"data channel closed: {ex.Message}");
+                TriggerAutoReconnect();
+            }
         }
     }
 
@@ -613,7 +676,10 @@ public sealed class MirrorSession : IAsyncDisposable
                 header[4] = 0x02; // heartbeat payload type
                 header[6] = 0x1e;
                 BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(8), _clock.FrameTimestamp);
-                SendPacket(header, []);
+                lock (_sendQueue)
+                {
+                    SendPacket(header, []);
+                }
             }
             catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
             {
@@ -630,14 +696,78 @@ public sealed class MirrorSession : IAsyncDisposable
             catch (OperationCanceledException) { return; }
             try
             {
-                await _rtsp.RequestAsync(new RtspRequest { Method = "POST", Uri = "/feedback" }, ct).ConfigureAwait(false);
+                await _rtsp.RequestAsync(new RtspRequest { Method = "POST", Uri = "/feedback", Headers = { ["Session"] = _sessionUuid } }, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is RtspException or IOException or SocketException or ObjectDisposedException)
             {
-                if (!ct.IsCancellationRequested) Stage($"feedback ended: {ex.Message}");
+                if (!ct.IsCancellationRequested)
+                {
+                    Stage($"feedback ended: {ex.Message}");
+                    TriggerAutoReconnect();
+                }
                 return;
             }
         }
+    }
+
+    private void TriggerAutoReconnect()
+    {
+        if (_cts.IsCancellationRequested || _remoteAddress is null || _credentials is null)
+            return;
+        if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                for (int attempt = 1; attempt <= 5 && !_cts.IsCancellationRequested; attempt++)
+                {
+                    Stage($"reconnecting mirror session (attempt {attempt})...");
+                    try { await Task.Delay(800, _cts.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { return; }
+
+                    try
+                    {
+                        lock (_sendQueue)
+                        {
+                            while (_sendQueue.TryTake(out _)) { }
+                            _codecSent = false;
+                        }
+                        try { _dataStream?.Dispose(); } catch { }
+                        try { _dataChannel?.Dispose(); } catch { }
+                        try { _eventChannel?.Dispose(); } catch { }
+                        try { _timingSocket?.Dispose(); } catch { }
+                        try { _audioDataSocket?.Dispose(); } catch { }
+                        try { _audioControlSocket?.Dispose(); } catch { }
+                        try { _videoCipher?.Dispose(); } catch { }
+                        try { _audioCipher?.Dispose(); } catch { }
+                        try { _rtsp.Dispose(); } catch { }
+
+                        _rtsp = new RtspConnection();
+                        _sessionUuid = Guid.NewGuid().ToString().ToUpperInvariant();
+                        _sessionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
+                        _videoStreamConnectionId = RandomNumberGenerator.GetInt32(1, int.MaxValue);
+
+                        await HandshakeAsync(_remoteAddress, _remotePort, _credentials, _cts.Token).ConfigureAwait(false);
+                        _source?.RequestKeyframe();
+                        _loops.Add(Task.Run(() => SendLoopAsync(_cts.Token)));
+                        _loops.Add(Task.Run(() => FeedbackLoopAsync(_cts.Token)));
+                        Stage("mirror session reconnected");
+                        return;
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch (Exception ex)
+                    {
+                        Stage($"reconnect attempt {attempt} failed: {ex.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _reconnecting, 0);
+            }
+        });
     }
 
     public async Task StopAsync()
@@ -722,7 +852,7 @@ public sealed class MirrorSession : IAsyncDisposable
 internal sealed class MirrorClock
 {
     private const ulong EpochOffsetSeconds = 2208988800UL;
-    private static readonly TimeSpan Bias = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan Bias = TimeSpan.FromMilliseconds(16);
     private readonly Stopwatch _sw = Stopwatch.StartNew();
 
     public ulong FrameTimestamp => ToNtp(_sw.Elapsed + Bias, 0);
