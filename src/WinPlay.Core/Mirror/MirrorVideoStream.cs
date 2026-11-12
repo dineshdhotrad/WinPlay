@@ -105,3 +105,191 @@ public sealed class MirrorVideoCipher(byte[] key) : IDisposable
 
     public void Dispose() => _cipher.Dispose();
 }
+
+/// <summary>
+/// Stateful AirPlay mirroring video framer: guarantees that the unencrypted 0x01 SPS/PPS
+/// codec packet and its accompanying encrypted 0x00 IDR frame share the exact same NTP
+/// timestamp, always advertise a valid full-screen TV viewport, and never advance the
+/// ChaCha20-Poly1305 AEAD nonce when non-IDR frames are dropped or waiting on SPS/PPS.
+/// </summary>
+internal sealed class MirrorVideoPacketizer
+{
+    private bool _codecSent;
+    private byte[]? _sps;
+    private byte[]? _pps;
+
+    public bool IsCodecSent => _codecSent;
+
+    public void Reset() => _codecSent = false;
+
+    public bool TryPacketize(
+        ReadOnlySpan<byte> annexB,
+        bool isKeyframe,
+        int sourceWidth,
+        int sourceHeight,
+        int receiverDisplayWidth,
+        int receiverDisplayHeight,
+        ulong ntpTimestamp,
+        MirrorVideoCipher cipher,
+        out byte[]? codecPacket,
+        out byte[]? videoPacket,
+        out bool needsKeyframe)
+    {
+        codecPacket = null;
+        videoPacket = null;
+        needsKeyframe = false;
+
+        var nals = H264.SplitAnnexB(annexB);
+        if (nals.Count == 0) return false;
+
+        bool spsPpsChanged = false;
+        foreach (byte[] nal in nals)
+        {
+            byte type = H264.NalType(nal);
+            if (type == H264.NalSps)
+            {
+                if (_sps is null || !_sps.AsSpan().SequenceEqual(nal)) spsPpsChanged = true;
+                _sps = nal;
+            }
+            else if (type == H264.NalPps)
+            {
+                if (_pps is null || !_pps.AsSpan().SequenceEqual(nal)) spsPpsChanged = true;
+                _pps = nal;
+            }
+        }
+
+        var vcl = nals.Where(n => H264.NalType(n) is 1 or 5).ToList();
+        if (vcl.Count == 0) return false;
+
+        if (!_codecSent && (!isKeyframe || _sps is null || _pps is null))
+        {
+            needsKeyframe = true;
+            return false;
+        }
+
+        if ((!_codecSent || (isKeyframe && spsPpsChanged)) && _sps is not null && _pps is not null)
+        {
+            int displayW = receiverDisplayWidth > 0 ? receiverDisplayWidth : 1920;
+            int displayH = receiverDisplayHeight > 0 ? receiverDisplayHeight : 1080;
+            byte[] avcc = H264.BuildAvcCConfig(_sps, _pps);
+            byte[] codecHeader = MirrorVideoStream.BuildCodecHeader(
+                avcc.Length, ntpTimestamp, sourceWidth, sourceHeight, displayW, displayH);
+
+            codecPacket = new byte[codecHeader.Length + avcc.Length];
+            codecHeader.CopyTo(codecPacket, 0);
+            avcc.CopyTo(codecPacket, codecHeader.Length);
+            _codecSent = true;
+        }
+
+        byte[] payload = H264.ToAvcc(vcl);
+        byte[] videoHeader = MirrorVideoStream.BuildVideoHeader(payload.Length + 16, isKeyframe, ntpTimestamp);
+        byte[] encrypted = cipher.Seal(videoHeader, payload);
+
+        videoPacket = new byte[videoHeader.Length + encrypted.Length];
+        videoHeader.CopyTo(videoPacket, 0);
+        encrypted.CopyTo(videoPacket, videoHeader.Length);
+        return true;
+    }
+}
+
+/// <summary>
+/// Thread-safe congestion controller for AirPlay TCP video delivery:
+/// <list type="bullet">
+/// <item>Absorbs normal Wi-Fi bursts (<c>queueDepth &lt; 24</c>, ~400 ms) via closed-loop ABR
+/// without dropping H.264 P-frames or breaking inter-frame reference chains.</item>
+/// <item>On severe link stalls (<c>queueDepth &gt;= 24</c>), cleanly drops non-IDR frames
+/// before AEAD encryption, requests at most one recovery IDR per 1500 ms (preventing
+/// back-to-back IDR keyframe congestion collapse), and resumes normal P-frame forwarding
+/// only once a fresh recovery IDR is accepted.</item>
+/// </list>
+/// </summary>
+internal sealed class MirrorCongestionController
+{
+    public const int SevereDropThreshold = 24;
+    public const long KeyframeCooldownMs = 1500;
+    private const long AbrStepDownCooldownMs = 350;
+    private const long AbrStepUpCooldownMs = 4000;
+
+    public readonly record struct FrameDecision(bool DropFrame, bool RequestKeyframe, double? BitrateScale);
+
+    private readonly object _gate = new();
+    private bool _awaitingRecoveryKeyframe;
+    private long _lastKeyframeRequestMs = -KeyframeCooldownMs;
+    private long _lastStepDownMs = -AbrStepDownCooldownMs;
+    private long _lastStepUpMs;
+
+    public void Reset()
+    {
+        lock (_gate)
+        {
+            _awaitingRecoveryKeyframe = false;
+            _lastKeyframeRequestMs = -KeyframeCooldownMs;
+            _lastStepDownMs = -AbrStepDownCooldownMs;
+            _lastStepUpMs = 0;
+        }
+    }
+
+    public FrameDecision EvaluateIncomingFrame(bool isKeyframe, int queueDepth, long nowMs)
+    {
+        lock (_gate)
+        {
+            if (isKeyframe)
+            {
+                // If the TCP queue is nearly full (>= 48 frames), even an IDR cannot fit safely;
+                // drop it and wait for queue drain before requesting another recovery IDR.
+                if (queueDepth >= 48)
+                {
+                    _awaitingRecoveryKeyframe = true;
+                    return new FrameDecision(DropFrame: true, RequestKeyframe: false, BitrateScale: 0.60);
+                }
+
+                _awaitingRecoveryKeyframe = false;
+                return new FrameDecision(DropFrame: false, RequestKeyframe: false, BitrateScale: null);
+            }
+
+            if (queueDepth >= SevereDropThreshold || _awaitingRecoveryKeyframe)
+            {
+                _awaitingRecoveryKeyframe = true;
+                bool canRequestIdr = (nowMs - _lastKeyframeRequestMs) >= KeyframeCooldownMs;
+                double? scale = null;
+                if (canRequestIdr)
+                {
+                    _lastKeyframeRequestMs = nowMs;
+                    _lastStepDownMs = nowMs;
+                    _lastStepUpMs = nowMs;
+                    scale = 0.65;
+                }
+                return new FrameDecision(DropFrame: true, RequestKeyframe: canRequestIdr, BitrateScale: scale);
+            }
+
+            return new FrameDecision(DropFrame: false, RequestKeyframe: false, BitrateScale: null);
+        }
+    }
+
+    public double? EvaluateSendCompletion(int queueDepth, double writeMs, long nowMs)
+    {
+        lock (_gate)
+        {
+            if ((queueDepth >= 8 || writeMs > 45.0) && (nowMs - _lastStepDownMs) >= AbrStepDownCooldownMs)
+            {
+                _lastStepDownMs = nowMs;
+                _lastStepUpMs = nowMs;
+                return 0.68;
+            }
+            if ((queueDepth >= 3 || writeMs > 22.0) && (nowMs - _lastStepDownMs) >= AbrStepDownCooldownMs)
+            {
+                _lastStepDownMs = nowMs;
+                _lastStepUpMs = nowMs;
+                return 0.82;
+            }
+            if (queueDepth == 0 && writeMs < 8.0 &&
+                (nowMs - _lastStepDownMs) >= AbrStepUpCooldownMs &&
+                (nowMs - _lastStepUpMs) >= AbrStepUpCooldownMs)
+            {
+                _lastStepUpMs = nowMs;
+                return 1.10;
+            }
+            return null;
+        }
+    }
+}

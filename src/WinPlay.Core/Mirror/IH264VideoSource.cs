@@ -23,6 +23,20 @@ public interface IH264VideoSource : IAsyncDisposable
     /// </summary>
     void Configure(int receiverDisplayWidth, int receiverDisplayHeight);
 
+    /// <summary>
+    /// Configures hardware-specific constraints based on the receiver's advertised model
+    /// identifier (e.g. <c>AppleTV5,3</c> vs. <c>AppleTV14,1</c>) and display dimensions.
+    /// </summary>
+    void ConfigureReceiverProfile(string? receiverModel, int receiverDisplayWidth, int receiverDisplayHeight)
+        => Configure(receiverDisplayWidth, receiverDisplayHeight);
+
+    /// <summary>
+    /// Dynamically scales the target encoder bitrate in response to real-time network or
+    /// receiver buffer telemetry (<paramref name="scaleFactor"/> &lt; 1.0 on congestion,
+    /// &gt; 1.0 on recovery).
+    /// </summary>
+    void AdjustBitrate(double scaleFactor) { }
+
     /// <summary>Begins capture + encode; runs until cancelled.</summary>
     Task StartAsync(CancellationToken ct);
 

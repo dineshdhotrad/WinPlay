@@ -1,34 +1,49 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Vortice.Direct3D11;
 using WinPlay.Core.Mirror;
 
 namespace WinPlay.Capture;
 
 /// <summary>
 /// <see cref="IH264VideoSource"/> that mirrors the primary desktop: DXGI Desktop
-/// Duplication → GPU BGRA → NV12 (color-convert + scale) → Media Foundation H.264 →
-/// Annex-B access units. The encode resolution is negotiated from the receiver's
-/// advertised display size (never hardcoded), fit to the desktop aspect ratio. Runs the
-/// capture/encode on a dedicated MTA thread paced to the target frame rate; when the
-/// screen is unchanged it re-encodes the previous frame so the receiver's clock keeps
-/// advancing (which the AirPlay pipeline requires).
+/// Duplication → GPU BGRA → NV12 texture ring (color-convert + scale) → zero-copy
+/// Media Foundation hardware H.264 (<c>IMFDXGIDeviceManager</c> + <c>MFCreateDXGISurfaceBuffer</c>)
+/// → Annex-B access units.
+///
+/// Automatically adapts resolution and CBR bitrate limits to the receiver's hardware
+/// model (<see cref="ConfigureReceiverProfile"/>) and adjusts encoder bitrate in real time
+/// (<see cref="AdjustBitrate"/>) in response to network/receiver backpressure.
 /// </summary>
 public sealed class ScreenMirrorSource : IH264VideoSource
 {
+    private const int MinBitrateBps = 2_500_000;
+
     private readonly int _fps;
     private readonly int _bitrateOverride;
     private Thread? _thread;
     private volatile bool _stopped;
     private int _receiverDisplayW;
     private int _receiverDisplayH;
+    private string? _receiverModel;
+    private int _maxAllowedBitrateBps = 8_000_000;
+    private int _currentBitrateBps = 6_500_000;
+    private IH264Encoder? _activeEncoder;
 
     public int Width { get; private set; }
     public int Height { get; private set; }
+    public int CurrentBitrateBps => Volatile.Read(ref _currentBitrateBps);
 
     public event Action<ReadOnlyMemory<byte>, bool>? FrameEncoded;
     public event Action<string>? Diagnostic;
 
-    /// <param name="bitrateMbps">Encoder bitrate; 0 = auto (scaled to the negotiated resolution).</param>
+    [DllImport("winmm.dll")]
+    private static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")]
+    private static extern uint timeEndPeriod(uint ms);
+
+    /// <param name="bitrateMbps">Encoder bitrate; 0 = auto (adapted to receiver model and resolution).</param>
     public ScreenMirrorSource(int fps = 60, int bitrateMbps = 0)
     {
         _fps = fps;
@@ -39,6 +54,51 @@ public sealed class ScreenMirrorSource : IH264VideoSource
     {
         _receiverDisplayW = receiverDisplayWidth;
         _receiverDisplayH = receiverDisplayHeight;
+    }
+
+    public void ConfigureReceiverProfile(string? receiverModel, int receiverDisplayWidth, int receiverDisplayHeight)
+    {
+        _receiverModel = receiverModel;
+        _receiverDisplayW = receiverDisplayWidth;
+        _receiverDisplayH = receiverDisplayHeight;
+        _maxAllowedBitrateBps = DetermineReceiverMaxBitrate(receiverModel, receiverDisplayWidth, receiverDisplayHeight);
+    }
+
+    /// <summary>
+    /// Selects a safe hardware CBR ceiling based on the Apple TV generation so older A8
+    /// receivers (<c>AppleTV5,3</c>) never experience decoder VBV overflow during fast 3D games,
+    /// while 4K Apple TV models (<c>AppleTV6,2</c>, <c>AppleTV11,1</c>, <c>AppleTV14,1</c>)
+    /// can scale to higher bitrates.
+    /// </summary>
+    internal static int DetermineReceiverMaxBitrate(string? model, int dispW, int dispH)
+    {
+        if (!string.IsNullOrEmpty(model))
+        {
+            if (model.StartsWith("AppleTV3", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV5", StringComparison.OrdinalIgnoreCase))
+            {
+                return 6_000_000; // Apple TV HD (A8): 6.0 Mbps High Profile (CABAC) sports-safe 1080p60 ceiling
+            }
+            if (model.StartsWith("AppleTV6", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV11", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV14", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV15", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV16", StringComparison.OrdinalIgnoreCase))
+            {
+                return 14_000_000; // Apple TV 4K (A10X / A12 / A15+): 14 Mbps High Profile ceiling
+            }
+        }
+        return (dispW > 1920 || dispH > 1080) ? 12_000_000 : 7_500_000;
+    }
+
+    public void AdjustBitrate(double scaleFactor)
+    {
+        if (_bitrateOverride > 0) return;
+        int cur = Volatile.Read(ref _currentBitrateBps);
+        int next = (int)Math.Clamp(Math.Round(cur * scaleFactor), MinBitrateBps, _maxAllowedBitrateBps);
+        if (Math.Abs(next - cur) < 250_000) return;
+        Volatile.Write(ref _currentBitrateBps, next);
+        _activeEncoder?.UpdateBitrate(next);
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -54,10 +114,11 @@ public sealed class ScreenMirrorSource : IH264VideoSource
         return Task.CompletedTask;
     }
 
-    public void RequestKeyframe() { /* the MFT emits an IDR + SPS/PPS as its first output automatically */ }
+    public void RequestKeyframe() => _activeEncoder?.ForceKeyframe();
 
     private void CaptureLoop(CancellationToken ct)
     {
+        timeBeginPeriod(1);
         DesktopDuplicator? capture = null;
         GpuColorConverter? converter = null;
         IH264Encoder? encoder = null;
@@ -66,47 +127,89 @@ public sealed class ScreenMirrorSource : IH264VideoSource
             capture = new DesktopDuplicator();
             int srcW = capture.Width, srcH = capture.Height;
 
-            // Negotiate the encode size: fit the desktop into the receiver's advertised
-            // display (or use the desktop size if none advertised). Even dimensions only.
             (Width, Height) = NegotiateEncodeSize(srcW, srcH, _receiverDisplayW, _receiverDisplayH);
-            int bitrate = _bitrateOverride > 0 ? _bitrateOverride : AutoBitrate(Width, Height, _fps);
+            int bitrate = _bitrateOverride > 0
+                ? _bitrateOverride
+                : Math.Min(AutoBitrate(Width, Height, _fps), _maxAllowedBitrateBps);
+            Volatile.Write(ref _currentBitrateBps, bitrate);
 
-            // GPU color-convert + scale (BGRA → NV12) on the capture device — the heaviest
-            // per-frame operation runs on the GPU (any vendor), keeping latency low.
             converter = new GpuColorConverter(capture.Device, srcW, srcH, Width, Height, _fps);
+            encoder = CreateEncoder(capture.Device, Width, Height, _fps, bitrate);
+            _activeEncoder = encoder;
+            encoder.Encoded += au => FrameEncoded?.Invoke(au, H264.ContainsKeyframeAnnexB(au.Span));
+            Diagnostic?.Invoke($"capture {srcW}x{srcH} on {capture.AdapterName} → encode {Width}x{Height} @ {_fps}fps, {bitrate / 1_000_000.0:F1} Mbps max {_maxAllowedBitrateBps / 1_000_000.0:F1} Mbps ({encoder.Name}, receiver={_receiverModel ?? "generic"})");
 
-            // Prefer the GPU hardware encoder (NVENC/QuickSync/AMF/Adreno); fall back to
-            // the software MFT only if no hardware encoder is present.
-            encoder = CreateEncoder(Width, Height, _fps, bitrate);
-            encoder.Encoded += au => FrameEncoded?.Invoke(au, IsKeyframe(au));
-            Diagnostic?.Invoke($"capture {srcW}x{srcH} → encode {Width}x{Height} @ {_fps}fps, {bitrate / 1_000_000} Mbps ({encoder.Name})");
-
-            byte[] nv12 = new byte[Width * Height * 3 / 2]; // NV12 = Y (w*h) + interleaved UV (w*h/2)
+            byte[]? cpuFallbackBuffer = encoder.IsZeroCopy ? null : new byte[Width * Height * 3 / 2];
+            ID3D11Texture2D? lastGpuTex = null;
             bool haveFrame = false;
+            int ringSlot = 0;
 
             var sw = Stopwatch.StartNew();
-            long frameIndex = 0;
-            double frameMs = 1000.0 / _fps;
+            double frameIntervalMs = 1000.0 / _fps;
+            double lastCaptureMs = -frameIntervalMs;
+            double lastKeepaliveMs = 0.0;
 
             while (!_stopped && !ct.IsCancellationRequested)
             {
-                double dueMs = frameIndex * frameMs;
                 double nowMs = sw.Elapsed.TotalMilliseconds;
-                if (nowMs < dueMs)
+                double waitMs = (lastCaptureMs + frameIntervalMs) - nowMs;
+                if (waitMs > 1.5)
                 {
-                    Thread.Sleep(Math.Max(1, (int)(dueMs - nowMs)));
+                    Thread.Sleep((int)(waitMs - 1.0));
+                    continue;
+                }
+                if (waitMs > 0.05)
+                {
+                    Thread.SpinWait(60);
                     continue;
                 }
 
-                if (capture.TryCaptureInto(converter.InputTexture, timeoutMs: 12))
-                {
-                    converter.Convert(nv12);
-                    haveFrame = true;
-                }
-                if (!haveFrame) { frameIndex++; continue; } // nothing captured yet
+                // Cap capture rate at <= 60 Hz on 240 Hz panels, while catching 30 / 50 / 60 FPS
+                // sports video frames within ~1 ms of DWM presentation without injecting fake
+                // duplicate frames between video frames.
+                bool capturedNew = capture.TryCaptureInto(converter, timeoutMs: haveFrame ? 0 : 16);
 
-                encoder.Encode(nv12);
-                frameIndex++;
+                if (capturedNew)
+                {
+                    double stampMs = sw.Elapsed.TotalMilliseconds;
+                    // Advance smoothly when in lock-step with 60 Hz, reset on pauses.
+                    lastCaptureMs = (stampMs - lastCaptureMs < frameIntervalMs * 2.0)
+                        ? lastCaptureMs + frameIntervalMs
+                        : stampMs;
+                    lastKeepaliveMs = stampMs;
+                    haveFrame = true;
+
+                    if (encoder.IsZeroCopy)
+                    {
+                        lastGpuTex = converter.ConvertToGpuTexture(ringSlot++);
+                        encoder.EncodeTexture(lastGpuTex);
+                    }
+                    else
+                    {
+                        converter.ConvertToCpuFallback(cpuFallbackBuffer!);
+                        encoder.EncodeCpu(cpuFallbackBuffer!);
+                    }
+                }
+                else if (haveFrame)
+                {
+                    double idleMs = sw.Elapsed.TotalMilliseconds - lastCaptureMs;
+                    // During 30 FPS (33.3 ms) or 50 FPS (20.0 ms) sports streams, wait 1 ms for the
+                    // real next video frame instead of polluting the encoder with duplicate frames.
+                    // Only emit a lightweight P-skip keepalive (~8 Hz) once the screen is truly static (>= 48 ms).
+                    if (idleMs >= 48.0 && (sw.Elapsed.TotalMilliseconds - lastKeepaliveMs) >= 120.0)
+                    {
+                        lastKeepaliveMs = sw.Elapsed.TotalMilliseconds;
+                        if (encoder.IsZeroCopy && lastGpuTex is not null)
+                        {
+                            encoder.EncodeTexture(lastGpuTex);
+                        }
+                        else if (!encoder.IsZeroCopy)
+                        {
+                            encoder.EncodeCpu(cpuFallbackBuffer!);
+                        }
+                    }
+                    Thread.Sleep(1);
+                }
             }
         }
         catch (Exception ex)
@@ -115,17 +218,19 @@ public sealed class ScreenMirrorSource : IH264VideoSource
         }
         finally
         {
+            _activeEncoder = null;
             encoder?.Dispose();
             converter?.Dispose();
             capture?.Dispose();
+            timeEndPeriod(1);
         }
     }
 
-    private IH264Encoder CreateEncoder(int width, int height, int fps, int bitrate)
+    private IH264Encoder CreateEncoder(ID3D11Device device, int width, int height, int fps, int bitrate)
     {
         try
         {
-            return new HardwareH264Encoder(width, height, fps, bitrate);
+            return new HardwareH264Encoder(device, width, height, fps, bitrate);
         }
         catch (Exception ex)
         {
@@ -134,30 +239,23 @@ public sealed class ScreenMirrorSource : IH264VideoSource
         }
     }
 
-    private static bool IsKeyframe(byte[] annexB) => H264.ContainsKeyframe(H264.SplitAnnexB(annexB));
-
-    /// <summary>
-    /// Fits the desktop into the receiver's display (if advertised), preserving aspect
-    /// ratio; both dimensions rounded down to even (NV12 requires even width and height).
-    /// No fixed cap — the resolution comes from what the receiver reports it can present.
-    /// </summary>
     internal static (int Width, int Height) NegotiateEncodeSize(int srcW, int srcH, int dispW, int dispH)
     {
-        int w = srcW, h = srcH;
-        if (dispW > 0 && dispH > 0 && (srcW > dispW || srcH > dispH))
+        int targetW = dispW > 0 ? dispW : 1920;
+        int targetH = dispH > 0 ? dispH : 1080;
+        if (targetW > 1920 || targetH > 1080)
         {
-            double scale = Math.Min((double)dispW / srcW, (double)dispH / srcH);
-            w = (int)Math.Round(srcW * scale);
-            h = (int)Math.Round(srcH * scale);
+            double scale = Math.Min(1920.0 / targetW, 1080.0 / targetH);
+            targetW = (int)Math.Round(targetW * scale);
+            targetH = (int)Math.Round(targetH * scale);
         }
-        return (Math.Max(2, w & ~1), Math.Max(2, h & ~1));
+        return (Math.Max(2, targetW & ~1), Math.Max(2, targetH & ~1));
     }
 
-    /// <summary>Bitrate scaled to resolution + frame rate (~0.10 bits/pixel/frame), clamped to a sane range.</summary>
     internal static int AutoBitrate(int width, int height, int fps)
     {
-        long bits = (long)(width * height * fps * 0.10);
-        return (int)Math.Clamp(bits, 4_000_000, 60_000_000);
+        long bits = (long)(width * height * fps * 0.077);
+        return (int)Math.Clamp(bits, 4_500_000, 16_000_000);
     }
 
     public ValueTask DisposeAsync()

@@ -99,6 +99,19 @@ public class H264Tests
         Assert.Equal(H264.NalPps, H264.NalType(nals[1]));
         Assert.Equal(H264.NalIdr, H264.NalType(nals[2]));
         Assert.True(H264.ContainsKeyframe(nals));
+        Assert.True(H264.ContainsKeyframeAnnexB(stream));
+    }
+
+    [Fact]
+    public void ContainsKeyframeAnnexB_ReturnsFalseForNonIdrStream()
+    {
+        byte[] nonIdrStream =
+        [
+            0, 0, 0, 1, 0x67, 0xAA, 0xBB,       // SPS (NAL 7)
+            0, 0, 1, 0x68, 0xCC,                // PPS (NAL 8)
+            0, 0, 0, 1, 0x41, 0x9A, 0x22, 0x33, // Non-IDR coded slice (NAL 1)
+        ];
+        Assert.False(H264.ContainsKeyframeAnnexB(nonIdrStream));
     }
 
     [Fact]
