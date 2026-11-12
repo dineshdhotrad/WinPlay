@@ -18,6 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="WinPlay.Core.Tests" />
     <ProjectReference Include="..\WinPlay.Core\WinPlay.Core.csproj" />
   </ItemGroup>
 

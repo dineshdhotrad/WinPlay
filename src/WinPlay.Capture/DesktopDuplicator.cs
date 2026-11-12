@@ -130,9 +130,7 @@ internal sealed class DesktopDuplicator : IDisposable
             if (texture is null)
                 return false;
 
-            var td = texture.Description;
-            converter.EnsureInputFormat((int)td.Width, (int)td.Height, td.Format);
-            Context.CopyResource(converter.InputTexture, texture);
+            converter.CopyCapturedFrame(texture);
             return true;
         }
         catch

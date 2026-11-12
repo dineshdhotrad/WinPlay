@@ -34,6 +34,7 @@ internal sealed class HardwareH264Encoder : IH264Encoder
     private static readonly Guid MF_LOW_LATENCY = new("9c27891a-ed7a-40e1-88e8-b22727a024ee");
     private static readonly Guid MFT_FRIENDLY_NAME = new("314ffbae-5b41-4c95-9c19-4e7d586face3");
 
+    private static readonly Guid CODECAPI_AVScenarioInfo = new("b28a6e64-3ff9-446a-8a4b-0d7a53413236");
     private static readonly Guid CODECAPI_AVLowLatencyMode = new("9c27891a-ed7a-40e1-88e8-b22727a024ee");
     private static readonly Guid CODECAPI_AVEncMPVDefaultBPictureCount = new("8d390aac-dc5c-4200-b57f-814d04babab2");
     private static readonly Guid CODECAPI_AVEncCommonQualityVsSpeed = new("98332df8-03cd-476b-89fa-3f9e442dec9f");
@@ -49,6 +50,7 @@ internal sealed class HardwareH264Encoder : IH264Encoder
     private const uint MFT_ENUM_FLAG_HARDWARE = 0x00000004;
     private const uint MFT_ENUM_FLAG_SORTANDFILTER = 0x00000040;
     private const uint InterlaceProgressive = 2;
+    private const uint ProfileHigh = 100;
     private const uint ProfileBaseline = 66;
 
     [StructLayout(LayoutKind.Explicit, Size = 24)]
@@ -69,7 +71,9 @@ internal sealed class HardwareH264Encoder : IH264Encoder
     private readonly int _height;
     private readonly long _frameDuration;
     private readonly Thread _eventThread;
-    private readonly BlockingCollection<ID3D11Texture2D> _pending = new(new ConcurrentQueue<ID3D11Texture2D>(), boundedCapacity: 1);
+    private readonly object _mftGate = new();
+    private ID3D11Texture2D? _latestPendingTex;
+    private int _needInputCredits;
     private byte[] _annexBScratch = new byte[512 * 1024];
     private volatile bool _stopped;
     private volatile int _forceKeyframePending;
@@ -150,13 +154,25 @@ internal sealed class HardwareH264Encoder : IH264Encoder
                         outType.Set(MF_MT_SUBTYPE, MFVideoFormat_H264);
                         outType.Set(MF_MT_AVG_BITRATE, (uint)bitrate);
                         outType.Set(MF_MT_INTERLACE_MODE, InterlaceProgressive);
-                        outType.Set(MF_MT_MPEG2_PROFILE, ProfileBaseline);
+                        outType.Set(MF_MT_MPEG2_PROFILE, ProfileHigh);
                         outType.Set(MF_MT_FRAME_SIZE, Pack(width, height));
                         outType.Set(MF_MT_FRAME_RATE, Pack(fps, 1));
                         outType.Set(MF_MT_PIXEL_ASPECT_RATIO, Pack(1, 1));
                         outType.Set(MF_MT_MAX_KEYFRAME_SPACING, (uint)(fps * 2));
-                        candidate.SetOutputType(0, outType, 0);
+                        try
+                        {
+                            candidate.SetOutputType(0, outType, 0);
+                        }
+                        catch
+                        {
+                            outType.Set(MF_MT_MPEG2_PROFILE, ProfileBaseline);
+                            candidate.SetOutputType(0, outType, 0);
+                        }
                     }
+
+                    // Configure CBR, VBV buffer, and TU7 preset AFTER SetOutputType and BEFORE SetInputType
+                    // (Intel QSV locks ICodecAPI rate-control parameters once SetInputType is called).
+                    TryConfigureLowLatencyAndCbrCodecApi(candidate, bitrate);
 
                     using (var inType = MediaFactory.MFCreateMediaType())
                     {
@@ -201,6 +217,12 @@ internal sealed class HardwareH264Encoder : IH264Encoder
             IntPtr setValPtr = Marshal.ReadIntPtr(vtbl, 9 * IntPtr.Size);
             var setVal = Marshal.GetDelegateForFunctionPointer<SetValueDelegate>(setValPtr);
 
+            // 0. Wireless display remoting scenario (eAVScenarioInfo_DisplayRemoting = 1)
+            // clamps Intel QSV frame-time jitter and slice bursts for real-time screen casting.
+            Guid propScenario = CODECAPI_AVScenarioInfo;
+            var vRemoting = new Variant { vt = 19 /* VT_UI4 */, ulVal = 1u };
+            setVal(codecApiPtr, ref propScenario, ref vRemoting);
+
             // 1. Low-latency mode (no frame lookahead)
             Guid propLowLat = CODECAPI_AVLowLatencyMode;
             var vBool = new Variant { vt = 11 /* VT_BOOL */, boolVal = -1 };
@@ -215,14 +237,22 @@ internal sealed class HardwareH264Encoder : IH264Encoder
             var vZero = new Variant { vt = 19 /* VT_UI4 */, ulVal = 0u };
             setVal(codecApiPtr, ref propBFrames, ref vZero);
 
-            // 3. Fastest speed preset for realtime game encoding
+            // 3. Ultra-fast hardware TU7 real-time preset (0/100) so high-motion sports panning
+            // completes in ~1.5-2.5 ms without contending with browser video decoding on the iGPU.
             Guid propSpeed = CODECAPI_AVEncCommonQualityVsSpeed;
-            setVal(codecApiPtr, ref propSpeed, ref vZero);
+            var vQuality = new Variant { vt = 19 /* VT_UI4 */, ulVal = 0u };
+            setVal(codecApiPtr, ref propSpeed, ref vQuality);
 
-            // 4. Strict CBR rate control with 0.5s VBV buffer so high-motion 3D games
-            // never spike bitrate and overflow AppleTV5,3 receiver buffers.
+            // 4. Peak-Constrained VBR (eAVEncCommonRateControlMode_PeakConstrainedVBR = 1) with
+            // compact 0.35s VBV buffer: strictly caps high-motion sports peaks at MaxBitRate while
+            // allowing zero-reset mid-stream MeanBitRate/MaxBitRate ABR updates on Intel Quick Sync
+            // (unlike CBR=0, where Intel QSV returns S_FALSE on mid-stream MeanBitRate changes).
             Guid propRc = CODECAPI_AVEncCommonRateControlMode;
-            setVal(codecApiPtr, ref propRc, ref vZero); // 0 = eAVEncCommonRateControlMode_CBR
+            var vPcvbr = new Variant { vt = 19 /* VT_UI4 */, ulVal = 1u };
+            if (setVal(codecApiPtr, ref propRc, ref vPcvbr) != 0)
+            {
+                setVal(codecApiPtr, ref propRc, ref vZero);
+            }
 
             Guid propMean = CODECAPI_AVEncCommonMeanBitRate;
             var vBitrate = new Variant { vt = 19 /* VT_UI4 */, ulVal = (uint)bitrate };
@@ -232,7 +262,7 @@ internal sealed class HardwareH264Encoder : IH264Encoder
             setVal(codecApiPtr, ref propMax, ref vBitrate);
 
             Guid propBuf = CODECAPI_AVEncCommonBufferSize;
-            var vBuf = new Variant { vt = 19 /* VT_UI4 */, ulVal = (uint)(bitrate / 2) };
+            var vBuf = new Variant { vt = 19 /* VT_UI4 */, ulVal = (uint)((long)bitrate * 35 / 100) };
             setVal(codecApiPtr, ref propBuf, ref vBuf);
         }
         catch
@@ -271,7 +301,7 @@ internal sealed class HardwareH264Encoder : IH264Encoder
                 Guid propMax = CODECAPI_AVEncCommonMaxBitRate;
                 setVal(codecApiPtr, ref propMax, ref vBitrate);
                 Guid propBuf = CODECAPI_AVEncCommonBufferSize;
-                var vBuf = new Variant { vt = 19 /* VT_UI4 */, ulVal = (uint)(newBitrate / 2) };
+                var vBuf = new Variant { vt = 19 /* VT_UI4 */, ulVal = (uint)((long)newBitrate * 35 / 100) };
                 setVal(codecApiPtr, ref propBuf, ref vBuf);
             }
 
@@ -321,9 +351,21 @@ internal sealed class HardwareH264Encoder : IH264Encoder
     public void EncodeTexture(ID3D11Texture2D nv12Texture)
     {
         if (_stopped) return;
-        while (!_pending.TryAdd(nv12Texture, 0) && !_stopped)
+        lock (_mftGate)
         {
-            if (!_pending.TryTake(out _)) break;
+            if (_stopped) return;
+            if (_needInputCredits > 0)
+            {
+                _needInputCredits--;
+                if (!FeedGpuTexture(nv12Texture))
+                {
+                    _latestPendingTex = nv12Texture;
+                }
+            }
+            else
+            {
+                _latestPendingTex = nv12Texture;
+            }
         }
     }
 
@@ -344,11 +386,26 @@ internal sealed class HardwareH264Encoder : IH264Encoder
                     switch (evt.EventType)
                     {
                         case MediaEventTypes.TransformNeedInput:
-                            if (_pending.TryTake(out ID3D11Texture2D? tex, Timeout.Infinite) && tex is not null)
-                                FeedGpuTexture(tex);
+                            // NEVER block _eventThread waiting for input! Blocking here prevents
+                            // TransformHaveOutput from draining already-encoded frames until the next tick.
+                            lock (_mftGate)
+                            {
+                                if (_stopped) return;
+                                if (_latestPendingTex is not null)
+                                {
+                                    var tex = _latestPendingTex;
+                                    _latestPendingTex = null;
+                                    if (!FeedGpuTexture(tex))
+                                        _needInputCredits++;
+                                }
+                                else
+                                {
+                                    _needInputCredits++;
+                                }
+                            }
                             break;
                         case MediaEventTypes.TransformHaveOutput:
-                            DrainOutput();
+                            DrainAllReadyOutputs();
                             break;
                     }
                 }
@@ -357,7 +414,7 @@ internal sealed class HardwareH264Encoder : IH264Encoder
         }
     }
 
-    private void FeedGpuTexture(ID3D11Texture2D nv12Texture)
+    private bool FeedGpuTexture(ID3D11Texture2D nv12Texture)
     {
         TryApplyDynamicEncoderUpdates();
 
@@ -375,59 +432,79 @@ internal sealed class HardwareH264Encoder : IH264Encoder
         sample.SampleTime = pts;
         sample.SampleDuration = _frameDuration;
         _frameIndex++;
-        try { _transform.ProcessInput(0, sample, 0); }
-        catch (SharpGenException) { /* encoder not ready; drop */ }
+        try
+        {
+            _transform.ProcessInput(0, sample, 0);
+            return true;
+        }
+        catch (SharpGenException)
+        {
+            return false;
+        }
     }
 
-    private void DrainOutput()
+    private void DrainAllReadyOutputs()
     {
         while (!_stopped)
         {
-            var streamInfo = _transform.GetOutputStreamInfo(0);
-            bool providesSamples = (streamInfo.Flags & 0x300) != 0;
-
-            using var outBuffer = providesSamples ? null : MediaFactory.MFCreateMemoryBuffer(Math.Max(streamInfo.Size, _width * _height));
-            using var outSample = providesSamples ? null : MediaFactory.MFCreateSample();
-            if (outSample is not null && outBuffer is not null) outSample.AddBuffer(outBuffer);
-
-            var dataBuffer = new OutputDataBuffer { StreamID = 0, Sample = outSample! };
-            Result result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref dataBuffer, out ProcessOutputStatus _);
-
-            if (result.Code == unchecked((int)0xC00D6D61)) // MF_E_TRANSFORM_STREAM_CHANGE
+            int producedLength = -1;
+            lock (_mftGate)
             {
-                try
+                if (_stopped) return;
+                var streamInfo = _transform.GetOutputStreamInfo(0);
+                bool providesSamples = (streamInfo.Flags & 0x300) != 0;
+
+                using var outBuffer = providesSamples ? null : MediaFactory.MFCreateMemoryBuffer(Math.Max(streamInfo.Size, _width * _height));
+                using var outSample = providesSamples ? null : MediaFactory.MFCreateSample();
+                if (outSample is not null && outBuffer is not null) outSample.AddBuffer(outBuffer);
+
+                var dataBuffer = new OutputDataBuffer { StreamID = 0, Sample = outSample! };
+                Result result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref dataBuffer, out ProcessOutputStatus _);
+
+                if (result.Code == unchecked((int)0xC00D6D61)) // MF_E_TRANSFORM_STREAM_CHANGE
                 {
-                    using var newType = _transform.GetOutputAvailableType(0, 0);
-                    _transform.SetOutputType(0, newType, 0);
+                    try
+                    {
+                        using var newType = _transform.GetOutputAvailableType(0, 0);
+                        _transform.SetOutputType(0, newType, 0);
+                    }
+                    catch (SharpGenException) { return; }
+                    continue;
                 }
-                catch (SharpGenException) { break; }
-                continue;
+
+                if (result == Vortice.MediaFoundation.ResultCode.TransformNeedMoreInput || result.Failure)
+                    return;
+
+                var produced = dataBuffer.Sample;
+                if (produced is null) return;
+
+                using var converted = produced.ConvertToContiguousBuffer();
+                converted.Lock(out IntPtr ptr, out int _, out int cur);
+                if (cur > _annexBScratch.Length)
+                    _annexBScratch = new byte[Math.Max(cur, _annexBScratch.Length * 2)];
+                Marshal.Copy(ptr, _annexBScratch, 0, cur);
+                converted.Unlock();
+                if (providesSamples) produced.Dispose();
+                producedLength = cur;
             }
 
-            if (result == Vortice.MediaFoundation.ResultCode.TransformNeedMoreInput || result.Failure) break;
-
-            var produced = dataBuffer.Sample;
-            if (produced is null) break;
-
-            using var converted = produced.ConvertToContiguousBuffer();
-            converted.Lock(out IntPtr ptr, out int _, out int cur);
-            if (cur > _annexBScratch.Length)
-                _annexBScratch = new byte[Math.Max(cur, _annexBScratch.Length * 2)];
-            Marshal.Copy(ptr, _annexBScratch, 0, cur);
-            converted.Unlock();
-            if (providesSamples) produced.Dispose();
-
-            Encoded?.Invoke(new ReadOnlyMemory<byte>(_annexBScratch, 0, cur));
-            break;
+            if (producedLength > 0)
+                Encoded?.Invoke(new ReadOnlyMemory<byte>(_annexBScratch, 0, producedLength));
+            else
+                return;
         }
     }
 
     public void Dispose()
     {
         _stopped = true;
-        _pending.CompleteAdding();
-        try { _transform.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch (SharpGenException) { }
-        try { _transform.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero); } catch (SharpGenException) { }
+        lock (_mftGate)
+        {
+            _latestPendingTex = null;
+            _needInputCredits = 0;
+            try { _transform.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch (SharpGenException) { }
+            try { _transform.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero); } catch (SharpGenException) { }
+        }
         _eventThread.Join(1000);
         _events.Dispose();
         _transform.Dispose();

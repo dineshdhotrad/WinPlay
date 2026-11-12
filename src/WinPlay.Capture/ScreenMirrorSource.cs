@@ -77,16 +77,18 @@ public sealed class ScreenMirrorSource : IH264VideoSource
             if (model.StartsWith("AppleTV3", StringComparison.OrdinalIgnoreCase) ||
                 model.StartsWith("AppleTV5", StringComparison.OrdinalIgnoreCase))
             {
-                return 8_000_000; // Apple TV HD (A8) and earlier: 8 Mbps safe CBR ceiling
+                return 6_000_000; // Apple TV HD (A8): 6.0 Mbps High Profile (CABAC) sports-safe 1080p60 ceiling
             }
             if (model.StartsWith("AppleTV6", StringComparison.OrdinalIgnoreCase) ||
                 model.StartsWith("AppleTV11", StringComparison.OrdinalIgnoreCase) ||
-                model.StartsWith("AppleTV14", StringComparison.OrdinalIgnoreCase))
+                model.StartsWith("AppleTV14", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV15", StringComparison.OrdinalIgnoreCase) ||
+                model.StartsWith("AppleTV16", StringComparison.OrdinalIgnoreCase))
             {
-                return 15_000_000; // Apple TV 4K (A10X / A12 / A15+): 15 Mbps ceiling
+                return 14_000_000; // Apple TV 4K (A10X / A12 / A15+): 14 Mbps High Profile ceiling
             }
         }
-        return (dispW > 1920 || dispH > 1080) ? 14_000_000 : 8_000_000;
+        return (dispW > 1920 || dispH > 1080) ? 12_000_000 : 7_500_000;
     }
 
     public void AdjustBitrate(double scaleFactor)
@@ -144,12 +146,13 @@ public sealed class ScreenMirrorSource : IH264VideoSource
 
             var sw = Stopwatch.StartNew();
             double frameIntervalMs = 1000.0 / _fps;
-            double nextFrameMs = 0.0;
+            double lastCaptureMs = -frameIntervalMs;
+            double lastKeepaliveMs = 0.0;
 
             while (!_stopped && !ct.IsCancellationRequested)
             {
                 double nowMs = sw.Elapsed.TotalMilliseconds;
-                double waitMs = nextFrameMs - nowMs;
+                double waitMs = (lastCaptureMs + frameIntervalMs) - nowMs;
                 if (waitMs > 1.5)
                 {
                     Thread.Sleep((int)(waitMs - 1.0));
@@ -161,19 +164,21 @@ public sealed class ScreenMirrorSource : IH264VideoSource
                     continue;
                 }
 
-                nextFrameMs += frameIntervalMs;
-                if (nowMs - nextFrameMs > frameIntervalMs)
-                    nextFrameMs = nowMs + frameIntervalMs;
-
-                // Pace DXGI polling strictly at 60 Hz (never 240 times/sec on a 240 Hz panel).
-                // Once streaming has started (haveFrame == true), poll non-blocking (timeoutMs: 0)
-                // so DXGI immediately returns the latest accumulated desktop surface in <0.02 ms
-                // without stalling the 60.0 Hz cadence on unchanged ticks.
+                // Cap capture rate at <= 60 Hz on 240 Hz panels, while catching 30 / 50 / 60 FPS
+                // sports video frames within ~1 ms of DWM presentation without injecting fake
+                // duplicate frames between video frames.
                 bool capturedNew = capture.TryCaptureInto(converter, timeoutMs: haveFrame ? 0 : 16);
 
                 if (capturedNew)
                 {
+                    double stampMs = sw.Elapsed.TotalMilliseconds;
+                    // Advance smoothly when in lock-step with 60 Hz, reset on pauses.
+                    lastCaptureMs = (stampMs - lastCaptureMs < frameIntervalMs * 2.0)
+                        ? lastCaptureMs + frameIntervalMs
+                        : stampMs;
+                    lastKeepaliveMs = stampMs;
                     haveFrame = true;
+
                     if (encoder.IsZeroCopy)
                     {
                         lastGpuTex = converter.ConvertToGpuTexture(ringSlot++);
@@ -187,17 +192,23 @@ public sealed class ScreenMirrorSource : IH264VideoSource
                 }
                 else if (haveFrame)
                 {
-                    // Reuse the already-converted GPU NV12 texture at 60 Hz so the hardware MFT
-                    // pipeline never holds the last active frame waiting for a subsequent input,
-                    // and emit a tiny P-skip slice without re-running 2560x1600 VideoProcessorBlt.
-                    if (encoder.IsZeroCopy && lastGpuTex is not null)
+                    double idleMs = sw.Elapsed.TotalMilliseconds - lastCaptureMs;
+                    // During 30 FPS (33.3 ms) or 50 FPS (20.0 ms) sports streams, wait 1 ms for the
+                    // real next video frame instead of polluting the encoder with duplicate frames.
+                    // Only emit a lightweight P-skip keepalive (~8 Hz) once the screen is truly static (>= 48 ms).
+                    if (idleMs >= 48.0 && (sw.Elapsed.TotalMilliseconds - lastKeepaliveMs) >= 120.0)
                     {
-                        encoder.EncodeTexture(lastGpuTex);
+                        lastKeepaliveMs = sw.Elapsed.TotalMilliseconds;
+                        if (encoder.IsZeroCopy && lastGpuTex is not null)
+                        {
+                            encoder.EncodeTexture(lastGpuTex);
+                        }
+                        else if (!encoder.IsZeroCopy)
+                        {
+                            encoder.EncodeCpu(cpuFallbackBuffer!);
+                        }
                     }
-                    else if (!encoder.IsZeroCopy)
-                    {
-                        encoder.EncodeCpu(cpuFallbackBuffer!);
-                    }
+                    Thread.Sleep(1);
                 }
             }
         }
@@ -230,22 +241,21 @@ public sealed class ScreenMirrorSource : IH264VideoSource
 
     internal static (int Width, int Height) NegotiateEncodeSize(int srcW, int srcH, int dispW, int dispH)
     {
-        int maxW = dispW > 0 ? Math.Min(dispW, 1920) : 1920;
-        int maxH = dispH > 0 ? Math.Min(dispH, 1080) : 1080;
-        int w = srcW, h = srcH;
-        if (srcW > maxW || srcH > maxH)
+        int targetW = dispW > 0 ? dispW : 1920;
+        int targetH = dispH > 0 ? dispH : 1080;
+        if (targetW > 1920 || targetH > 1080)
         {
-            double scale = Math.Min((double)maxW / srcW, (double)maxH / srcH);
-            w = (int)Math.Round(srcW * scale);
-            h = (int)Math.Round(srcH * scale);
+            double scale = Math.Min(1920.0 / targetW, 1080.0 / targetH);
+            targetW = (int)Math.Round(targetW * scale);
+            targetH = (int)Math.Round(targetH * scale);
         }
-        return (Math.Max(2, w & ~1), Math.Max(2, h & ~1));
+        return (Math.Max(2, targetW & ~1), Math.Max(2, targetH & ~1));
     }
 
     internal static int AutoBitrate(int width, int height, int fps)
     {
-        long bits = (long)(width * height * fps * 0.06);
-        return (int)Math.Clamp(bits, 4_000_000, 12_000_000);
+        long bits = (long)(width * height * fps * 0.077);
+        return (int)Math.Clamp(bits, 4_500_000, 16_000_000);
     }
 
     public ValueTask DisposeAsync()
