@@ -30,6 +30,10 @@ give discovery a few extra seconds so both are resolved.
 - **`MF_E_INVALIDMEDIATYPE`** — the encoder rejected the frame size. WinPlay negotiates and
   scales the resolution, but if you hit this, lower `--fps` or force a smaller size by
   mirroring to a receiver that advertises a display size.
+- **Black screen on the TV and `0 frames sent`** — the encoder produced no output. On
+  Intel Quick Sync this was an unhandled output-type renegotiation (fixed after 0.1.1);
+  if it recurs on another GPU, include the `capture:` line (it names the encoder) in your
+  bug report.
 - **Black screen on the TV but frames are sent** — re‑pair the Apple TV
   (`winplay pair`), then mirror again; stale credentials can decrypt‑fail silently.
 

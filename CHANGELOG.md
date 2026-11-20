@@ -4,6 +4,15 @@ All notable changes to WinPlay are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Black screen when mirroring on Intel GPUs** — the Intel Quick Sync H.264 encoder
+  renegotiates its output type (`MF_E_TRANSFORM_STREAM_CHANGE`) before its first frame;
+  WinPlay ignored this, so the encoder stalled and no video reached the Apple TV. The new
+  output type is now adopted and encoding continues.
+
 ## [0.1.1] — 2026-08-18
 
 Maintenance release — functionally identical to 0.1.0. The v0.2.0 release has been
