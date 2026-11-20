@@ -197,27 +197,46 @@ internal sealed class HardwareH264Encoder : IH264Encoder
         catch (SharpGenException) { /* encoder not ready; drop */ }
     }
 
+    /// <summary>
+    /// Pulls one encoded sample. Some hardware encoders — Intel Quick Sync on Arc / Lunar
+    /// Lake for one — answer their first METransformHaveOutput with
+    /// MF_E_TRANSFORM_STREAM_CHANGE: they renegotiate the output type (attaching the codec
+    /// private data) before emitting anything. The client must adopt the new type and call
+    /// ProcessOutput again; no further HaveOutput event arrives for that sample, so ignoring
+    /// it stalls the MFT for good — no SPS/PPS, no frames, a black receiver.
+    /// </summary>
     private void DrainOutput()
     {
-        var streamInfo = _transform.GetOutputStreamInfo(0);
-        bool providesSamples = (streamInfo.Flags & 0x300) != 0; // PROVIDES_SAMPLES | CAN_PROVIDE_SAMPLES
+        const int maxStreamChanges = 2;
+        for (int attempt = 0; attempt <= maxStreamChanges; attempt++)
+        {
+            var streamInfo = _transform.GetOutputStreamInfo(0);
+            bool providesSamples = (streamInfo.Flags & 0x300) != 0; // PROVIDES_SAMPLES | CAN_PROVIDE_SAMPLES
 
-        using var outBuffer = providesSamples ? null : MediaFactory.MFCreateMemoryBuffer(Math.Max(streamInfo.Size, _width * _height));
-        using var outSample = providesSamples ? null : MediaFactory.MFCreateSample();
-        if (outSample is not null && outBuffer is not null) outSample.AddBuffer(outBuffer);
+            using var outBuffer = providesSamples ? null : MediaFactory.MFCreateMemoryBuffer(Math.Max(streamInfo.Size, _width * _height));
+            using var outSample = providesSamples ? null : MediaFactory.MFCreateSample();
+            if (outSample is not null && outBuffer is not null) outSample.AddBuffer(outBuffer);
 
-        var dataBuffer = new OutputDataBuffer { StreamID = 0, Sample = outSample! };
-        Result result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref dataBuffer, out ProcessOutputStatus _);
-        if (result == ResultCode.TransformNeedMoreInput || result.Failure) return;
+            var dataBuffer = new OutputDataBuffer { StreamID = 0, Sample = outSample! };
+            Result result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref dataBuffer, out ProcessOutputStatus _);
+            if (result == ResultCode.TransformStreamChange)
+            {
+                using var newType = _transform.GetOutputAvailableType(0, 0);
+                _transform.SetOutputType(0, newType, 0);
+                continue;
+            }
+            if (result == ResultCode.TransformNeedMoreInput || result.Failure) return;
 
-        var produced = dataBuffer.Sample;
-        using var converted = produced.ConvertToContiguousBuffer();
-        converted.Lock(out IntPtr ptr, out int _, out int cur);
-        byte[] annexB = new byte[cur];
-        Marshal.Copy(ptr, annexB, 0, cur);
-        converted.Unlock();
-        if (providesSamples) produced.Dispose();
-        Encoded?.Invoke(annexB);
+            var produced = dataBuffer.Sample;
+            using var converted = produced.ConvertToContiguousBuffer();
+            converted.Lock(out IntPtr ptr, out int _, out int cur);
+            byte[] annexB = new byte[cur];
+            Marshal.Copy(ptr, annexB, 0, cur);
+            converted.Unlock();
+            if (providesSamples) produced.Dispose();
+            Encoded?.Invoke(annexB);
+            return;
+        }
     }
 
     public void Dispose()
